@@ -84,24 +84,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ─────────────────────────────────────────────────────────────────────────
 STRATEGY_PRESETS = {
     "scalping": { # 초단타 (1분봉: 노이즈 대비 손절 여유, 수수료 극복 위한 익절 상향)
-        "take_profit_percent": 0.02,   # [Modified] 5% -> 2% (현실화)
-        "trailing_stop_percent": 0.01, # [Modified] 1.5% -> 1% (타이트한 관리)
-        "take_profit_percent": 0.02,   # [Modified] 5% -> 2% (현실화)
-        "trailing_stop_percent": 0.01, # [Modified] 1.5% -> 1% (타이트한 관리)
+        # 목표 수익률 (2%): 짧은 파동을 취함. 수수료(약 0.1~0.2%) 고려 시 최소 1% 이상 권장.
+        "take_profit_percent": 0.02,
+        # 트레일링 스탑 (1%): 고점 대비 1% 하락 시 이익 실현 (추세 반전 시 빠른 청산)
+        "trailing_stop_percent": 0.01,
         "timeframe": "1m",
     },
     "short_term": { # 단기 (15분봉: 데이트레이딩, 손익비 1:2 목표)
-        "take_profit_percent": 0.06,    # 6.0%
-        "trailing_stop_percent": 0.015,
+        "take_profit_percent": 0.06,    # 6.0% 목표
+        "trailing_stop_percent": 0.015, # 1.5% 반전 시 청산
         "timeframe": "15m",
     },
     "mid_term": { # 중기 (4시간봉: 스윙, 추세 추종)
-        "take_profit_percent": 0.20,
-        "trailing_stop_percent": 0.04,  # 4.0%
+        "take_profit_percent": 0.20,    # 20% 목표 (큰 추세)
+        "trailing_stop_percent": 0.04,  # 4.0% 반전 시 청산 (노이즈 견딤)
         "timeframe": "4h",
     },
     "long_term": { # 장기 (일봉: 대세 상승)
-        "take_profit_percent": 0.50,
+        "take_profit_percent": 0.50,    # 50% 목표
         "trailing_stop_percent": 0.10,
         "timeframe": "1d",
     }
@@ -132,24 +132,24 @@ TRADING_CONFIG = {
     # ─────────────────────────────────────────────────────────────────────────
     "crypto": {
         "symbols": ["SOL/KRW", "XRP/KRW", "DOGE/KRW", "AVAX/KRW"],  # [변경] 알트코인 위주 구성
-        "initial_capital": get_env_float("CRYPTO_INITIAL_CAPITAL", 300000),
-        "max_position_size": get_env_float("CRYPTO_MAX_POSITION_SIZE", 0.2),
+        "initial_capital": get_env_float("CRYPTO_INITIAL_CAPITAL", 300000), # 봇 운용 초기 자본금 (KRW)
+        "max_position_size": get_env_float("CRYPTO_MAX_POSITION_SIZE", 0.2), # 종목당 최대 투자 비중 (0.2 = 20%)
         # 전략 프리셋 또는 .env 개별 설정으로 값 결정
         "take_profit_percent": get_env_float("TAKE_PROFIT_PCT", get_env_float("CRYPTO_TAKE_PROFIT", selected_strategy["take_profit_percent"])),
         "trailing_stop_percent": get_env_float("CRYPTO_TRAILING_STOP", 0.015), # 기본값 1.5%
         "timeframe": os.getenv("CRYPTO_TIMEFRAME", selected_strategy["timeframe"]),
         "max_positions": get_env_int("CRYPTO_MAX_POSITIONS", 5),      # 최대 보유 종목 수 (기본값 5개)
         "min_order_amount": get_env_float("CRYPTO_MIN_ORDER_AMOUNT", 5000), # 최소 주문 금액 (기본값 5000원)
-        "cancel_timeout": get_env_int("CRYPTO_CANCEL_TIMEOUT", 300),  # 미체결 주문 취소 대기 시간 (초, 기본값 300초)
+        "cancel_timeout": get_env_int("CRYPTO_CANCEL_TIMEOUT", 300),  # 미체결 주문 자동 취소 대기 시간 (초)
         "slippage_ticks": get_env_int("CRYPTO_SLIPPAGE_TICKS", 2),    # [New] 공격적 지정가 슬리피지 허용 틱 (기본 2틱)
         "order_wait_seconds": get_env_int("CRYPTO_ORDER_WAIT_SECONDS", 5), # [New] 주문 체결 대기 시간 (초)
-        "atr_window": get_env_int("CRYPTO_ATR_WINDOW", 20), # ATR 계산 기간 (기본값 20)
-        "atr_multiplier": get_env_float("CRYPTO_ATR_MULTIPLIER", 2.0), # ATR 기반 손절 배수 (보통 1.5~3.0 사용) 코인의 높은 변동성을 고려해 2.5N으로 여유 부여
-        "adx_threshold": get_env_float("CRYPTO_ADX_THRESHOLD", 15.0),  # ADX 추세 강도 필터 (15로 완화하여 빠른 진입)
-        "volatility_threshold": get_env_float("CRYPTO_VOLATILITY_THRESHOLD", 0.8), # 최소 변동성 기준 (0.5% -> 0.8% 상향 조정)
-        "stop_loss_percent": get_env_float("STOP_LOSS_PCT", get_env_float("CRYPTO_STOP_LOSS", 0.0)), # 고정 손절 % (0이면 ATR 사용)
+        "atr_window": get_env_int("CRYPTO_ATR_WINDOW", 20), # ATR(변동성) 지표 계산 기간
+        "atr_multiplier": get_env_float("CRYPTO_ATR_MULTIPLIER", 2.0), # 손절 범위 계수 (ATR * n). 클수록 손절 라인이 여유로워짐 (권장 1.5~3.0)
+        "adx_threshold": get_env_float("CRYPTO_ADX_THRESHOLD", 15.0),  # 추세 강도 필터 (높을수록 강한 추세에서만 진입)
+        "volatility_threshold": get_env_float("CRYPTO_VOLATILITY_THRESHOLD", 0.8), # 최소 변동성 기준 (횡보장 매매 방지)
+        "stop_loss_percent": get_env_float("STOP_LOSS_PCT", get_env_float("CRYPTO_STOP_LOSS", 0.0)), # 고정 손절 % (0이면 ATR 기반 동적 손절 사용)
         "entry_strategy": os.getenv("CRYPTO_ENTRY_STRATEGY", "breakout"), # 진입 전략 (breakout, combined, rsi, macd, bollinger, bb_breakout, rsi_bollinger, turtle_bollinger)
-        "k_value": get_env_float("CRYPTO_K_VALUE", 0.6), # 변동성 돌파 전략 K값
+        "k_value": get_env_float("CRYPTO_K_VALUE", 0.6), # 변동성 돌파 전략 K값 (0.4~0.7 권장). 낮을수록 진입 빠름/속임수 많음.
         "strategy_type": os.getenv("STRATEGY_TYPE", os.getenv("CRYPTO_STRATEGY_TYPE", "technical")), # 사용할 메인 전략
         # 피라미딩(불타기) 설정
         "pyramiding_enabled": True,   # 피라미딩 활성화 여부

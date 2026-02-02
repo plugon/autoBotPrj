@@ -685,18 +685,53 @@ class AutoTradingBot:
         """바이낸스 API 에러 콜백 처리"""
         self._send_telegram_alert(f"🚨 [BINANCE] {message}")
 
-    def _send_telegram_alert(self, message):
+    def _send_telegram_alert(self, message, parse_mode=None):
         """텔레그램으로 긴급 알림 전송"""
         try:
             from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+                if parse_mode:
+                    data["parse_mode"] = parse_mode
                 response = requests.post(url, data=data, timeout=5)
                 if response.status_code != 200:
                     logger.error(f"텔레그램 전송 실패: {response.text}")
         except Exception as e:
             logger.error(f"텔레그램 전송 실패: {e}")
+
+    def _send_config_summary(self):
+        """봇 시작 시 현재 설정 요약 전송"""
+        try:
+            from config.settings import selected_strategy_name
+            
+            msg = "🤖 *자동매매 봇 시작 알림*\n\n"
+            msg += f"📌 *적용 전략*: `{selected_strategy_name.upper()}`\n"
+            
+            # Crypto Config
+            c_conf = TRADING_CONFIG["crypto"]
+            msg += "\n📊 *[UPBIT] 설정*\n"
+            msg += f"• 타임프레임: `{c_conf['timeframe']}`\n"
+            msg += f"• K-Value: `{c_conf['k_value']}`\n"
+            msg += f"• 익절률: `{c_conf['take_profit_percent']*100:.1f}%`\n"
+            msg += f"• 손절률: `{c_conf['stop_loss_percent']*100:.1f}%` (0=ATR)\n"
+            msg += f"• 트레일링스탑: `{c_conf['trailing_stop_percent']*100:.1f}%`\n"
+            msg += f"• 최대보유: `{c_conf['max_positions']}종목`\n"
+            
+            # Binance Config (if enabled)
+            if getattr(self, 'binance_api', None):
+                b_conf = TRADING_CONFIG["binance"]
+                msg += "\n📊 *[BINANCE] 설정*\n"
+                msg += f"• 타임프레임: `{b_conf['timeframe']}`\n"
+                msg += f"• 레버리지: `{b_conf.get('leverage', 1)}x`\n"
+                msg += f"• 익절률: `{b_conf['take_profit_percent']*100:.1f}%`\n"
+                msg += f"• 손절률: `{b_conf['stop_loss_percent']*100:.1f}%`\n"
+            
+            self._send_telegram_alert(msg, parse_mode="Markdown")
+            logger.info("✅ 설정 요약 텔레그램 전송 완료")
+            
+        except Exception as e:
+            logger.error(f"설정 요약 전송 실패: {e}")
 
     def _update_status(self, status=None):
         """봇 상태(Heartbeat) 업데이트"""
@@ -1676,8 +1711,8 @@ class AutoTradingBot:
                     continue
 
             # [Phase 2] 신규 진입 (매수) - 별도 루프
-            # 보유 중이지 않은 종목만 대상
-            target_symbols = [s for s in symbols if s not in portfolio.positions]
+            # 관심 종목 전체 대상 (보유 종목 포함하여 피라미딩 기회 포착)
+            target_symbols = symbols
             
             for symbol in target_symbols:
                 try:
@@ -1685,9 +1720,12 @@ class AutoTradingBot:
                     current_price = api.get_price(symbol)
                     if current_price == 0: continue
 
+                    # 보유 여부 확인
+                    is_holding = symbol in portfolio.positions
+
                     # 2. 진입 여부 판단
                     # 신규 진입인데 최대 보유 종목 수 꽉 찼으면 스킵
-                    if len(portfolio.positions) >= TRADING_CONFIG[config_key].get("max_positions", 5):
+                    if not is_holding and len(portfolio.positions) >= TRADING_CONFIG[config_key].get("max_positions", 5):
                         continue
                     
                     # [전략 및 타임프레임 분리]
@@ -1875,6 +1913,9 @@ class AutoTradingBot:
                                 buy_qty = buy_amount / denominator
                                 buy_qty = float(f"{buy_qty:.8f}") # 소수점 8자리 제한 (API 오류 방지)
                                 
+                                # [New] 레버리지 정보 추출
+                                leverage = signal.suggested_leverage if signal else 1
+                                
                                 # [로그 상세화] 매수 진입 전 지표 요약
                                 atr_val = signal.atr_value if signal and signal.atr_value else 0.0
                                 conf_score = signal.confidence if signal else 0.0
@@ -1886,7 +1927,7 @@ class AutoTradingBot:
                                     logger.info(f"[{exchange_name}] 매수 주문 시도: {symbol} {buy_qty:.8f}개 @ {ask_price:,.0f}원")
                                 
                                 # price=None을 전달하여 공격적 지정가 로직 활성화
-                                result = api.buy(symbol, buy_qty, price=None)
+                                result = api.buy(symbol, buy_qty, price=None, leverage=leverage)
                                 
                                 if result:
                                     # 수수료 및 실제 구매 수량 계산
@@ -1910,7 +1951,7 @@ class AutoTradingBot:
                                     # [New] 레버리지 정보 표시 (바이낸스 선물)
                                     lev_info = ""
                                     if config_key == "binance" and TRADING_CONFIG["binance"].get("futures_enabled", False):
-                                        lev_info = f" (Lev: {TRADING_CONFIG['binance'].get('leverage', 1)}x)"
+                                        lev_info = f" (Lev: {leverage}x)"
 
                                     logger.warning("="*70)
                                     logger.warning(f"[{exchange_name}] [{type_str}] {symbol}{lev_info}")
@@ -2098,6 +2139,9 @@ class AutoTradingBot:
         
         # 모델 학습
         self.train_ml_model()
+        
+        # [New] 설정 요약 전송
+        self._send_config_summary()
         
         # [즉시 실행] 봇 시작 직후 초기 매매 판단 실행
         logger.info("🚀 봇 시작 직후 초기 매매 판단을 실행합니다...")

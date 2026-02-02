@@ -40,7 +40,7 @@ class BaseAPI(ABC):
         pass
     
     @abstractmethod
-    def buy(self, symbol: str, quantity: float, price: Optional[float] = None) -> Dict:
+    def buy(self, symbol: str, quantity: float, price: Optional[float] = None, **kwargs) -> Dict:
         """매수 주문"""
         pass
     

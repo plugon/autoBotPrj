@@ -21,6 +21,7 @@ class Signal:
     suggested_quantity: float = 0.0
     suggested_stop_loss: Optional[float] = None  # ATR 기반 추천 손절가
     atr_value: Optional[float] = None  # ATR(N) 값
+    suggested_leverage: int = 1  # [New] 변동성 기반 추천 레버리지
 
 
 class TradingStrategy:
@@ -100,6 +101,14 @@ class MLStrategy(TradingStrategy):
                     risk_amt = current_capital * 0.01
                     suggested_qty = risk_amt / stop_dist
 
+            # [New] Dynamic Leverage Calculation (변동성 기반 레버리지)
+            # 목표 변동성(2%) / 현재 변동성(ATR%)
+            target_vol = TRADING_CONFIG.get("binance", {}).get("target_volatility", 0.02)
+            leverage = 1
+            if atr > 0 and current_price > 0:
+                atr_pct = atr / current_price
+                leverage = max(1, min(int(target_vol / atr_pct), 10))
+
             # 방향성 예측
             direction = self.ml_predictor.predict_direction(
                 data, current_price
@@ -126,7 +135,8 @@ class MLStrategy(TradingStrategy):
                     reason=f"상승 추세 예상 (신뢰도: {confidence:.2f})",
                     suggested_quantity=suggested_qty if suggested_qty > 0 else 0.0,
                     suggested_stop_loss=atr_stop_loss,
-                    atr_value=atr
+                    atr_value=atr,
+                    suggested_leverage=leverage
                 )
             elif direction == "DOWN":
                 return Signal(
@@ -611,6 +621,14 @@ class TechnicalStrategy(TradingStrategy):
             # 단, 직전 저점이 현재가와 너무 가까우면(0.5% 미만) ATR 사용
             final_stop_loss = recent_low_stop_loss if recent_low_stop_loss < current_price * 0.995 else atr_stop_loss
 
+            # [New] Dynamic Leverage Calculation
+            target_vol = TRADING_CONFIG.get("binance", {}).get("target_volatility", 0.02)
+            leverage = 1
+            if atr > 0 and current_price > 0:
+                atr_pct = atr / current_price
+                if atr_pct > 0:
+                    leverage = max(1, min(int(target_vol / atr_pct), 10))
+
             if buy_count > sell_count:
                 return Signal(
                     symbol=symbol,
@@ -619,7 +637,8 @@ class TechnicalStrategy(TradingStrategy):
                     reason=f"매수 신호: {reasons} (ADX:{adx:.1f})",
                     suggested_quantity=suggested_qty if suggested_qty > 0 else 0.0,
                     suggested_stop_loss=final_stop_loss,
-                    atr_value=atr
+                    atr_value=atr,
+                    suggested_leverage=leverage
                 )
             else:
                 return Signal(

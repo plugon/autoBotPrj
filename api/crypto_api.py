@@ -325,7 +325,7 @@ class UpbitAPI(BaseAPI):
         # 호가 단위에 맞춰 버림 처리 (매수/매도 공통 안전하게)
         return float(int(price / tick) * tick)
 
-    def buy(self, symbol: str, quantity: float, price: Optional[float] = None) -> Dict:
+    def buy(self, symbol: str, quantity: float, price: Optional[float] = None, **kwargs) -> Dict:
         """매수 주문 (재시도 로직 포함)"""
         # [요청사항] price가 없으면 '공격적 지정가' 주문 로직 수행
         if price is None:
@@ -671,6 +671,7 @@ class BinanceAPI(BaseAPI):
         self.is_future = False
         self.last_ws_update = 0
         self.error_callbacks = []
+        self.leverage_cache = {} # [New] 레버리지 캐시
     
     def connect(self):
         """바이낸스 API 연결"""
@@ -717,9 +718,20 @@ class BinanceAPI(BaseAPI):
     def set_leverage(self, symbol: str, leverage: int):
         """[New] 레버리지 설정"""
         try:
+            # 캐시 확인 (불필요한 API 호출 방지)
+            prev_lev = self.leverage_cache.get(symbol)
+            if prev_lev == leverage:
+                return
+
             # ccxt unified method
             self.exchange.set_leverage(leverage, symbol)
-            logger.info(f"⚙️ [BINANCE] {symbol} 레버리지 설정: {leverage}x")
+            self.leverage_cache[symbol] = leverage
+            
+            if prev_lev:
+                direction = "상향" if leverage > prev_lev else "하향"
+                logger.info(f"⚖️ [DYNAMIC LEVERAGE] 변동성 감지: {symbol} 레버리지를 {prev_lev}배에서 {leverage}배로 {direction} 조정합니다.")
+            else:
+                logger.info(f"⚙️ [BINANCE] {symbol} 레버리지 초기 설정: {leverage}x")
         except Exception as e:
             logger.warning(f"{symbol} 레버리지 설정 실패: {e}")
 
@@ -894,12 +906,16 @@ class BinanceAPI(BaseAPI):
             logger.error(f"포지션 조회 오류: {e}")
             return []
 
-    def buy(self, symbol: str, quantity: float, price: Optional[float] = None) -> Dict:
+    def buy(self, symbol: str, quantity: float, price: Optional[float] = None, leverage: int = 1, **kwargs) -> Dict:
         """매수 주문 (재시도 및 공격적 지정가 포함)"""
         # [요청사항 4] 주문 전 클린 슬레이트 (미체결 취소 -> 대기 -> 설정 확인)
         self.cancel_all_orders(symbol)
         time.sleep(0.5)
         self._ensure_market_settings(symbol)
+
+        # [New] 동적 레버리지 적용
+        if self.is_future and leverage > 1:
+            self.set_leverage(symbol, leverage)
 
         if price is None:
             return self._buy_aggressive(symbol, quantity)
