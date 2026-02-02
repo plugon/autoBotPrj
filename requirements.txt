@@ -1,0 +1,12 @@
+pandas
+numpy
+python-dotenv
+ccxt
+ta
+scikit-learn
+apscheduler
+pyupbit
+streamlit
+matplotlib
+openpyxl
+requests

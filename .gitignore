@@ -1,0 +1,18 @@
+# 보안 파일 (절대 올리지 말 것)
+.env
+
+# Python 및 빌드 관련
+__pycache__/
+*.py[cod]
+venv/
+build/
+dist/
+*.spec
+.venv/
+
+# 데이터 및 로그
+logs/
+data/
+models/
+*.log
+*.csv
