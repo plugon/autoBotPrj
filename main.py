@@ -12,9 +12,13 @@ import json
 import requests
 import threading
 import pandas as pd
+import numpy as np
 import multiprocessing
 import psutil
 import shutil
+import joblib
+import warnings
+import concurrent.futures
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from ta.volatility import AverageTrueRange
@@ -31,6 +35,7 @@ from trading.turtle_bollinger_strategy import TurtleBollingerStrategy
 from utils.report_manager import ReportManager
 from trading.portfolio import Portfolio
 from trading.risk_manager import RiskManager
+from utils.backtesting import WalkForwardAnalyzer
 from utils.logger import setup_logger
 
 # 로거 설정
@@ -43,6 +48,56 @@ logger = setup_logger("trading_bot", log_level)
 logging.getLogger('ccxt').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
+# [Request] sklearn 관련 불필요한 경고 무시 (UserWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+# [Request 3] 병렬 처리를 위한 독립 함수 (Pickling 가능해야 함)
+def _train_model_task(symbol, data, ml_config, api_name):
+    """개별 종목 모델 학습 및 전진분석 태스크 (병렬 처리용)"""
+    try:
+        # [Request 4] 지표 선행 계산 (Caching 효과)
+        # 데이터프레임 전체에 대해 지표를 한 번만 계산하여 컬럼에 추가
+        import ta
+        
+        # RSI
+        data['RSI'] = ta.momentum.rsi(data['close'], window=14)
+        
+        # MACD
+        macd = ta.trend.MACD(data['close'])
+        data['MACD'] = macd.macd()
+        data['MACD_Signal'] = macd.macd_signal()
+        data['MACD_Hist'] = macd.macd_diff()
+        
+        # Bollinger Bands
+        bb = ta.volatility.BollingerBands(data['close'], window=20, window_dev=2)
+        data['BB_Upper'] = bb.bollinger_hband()
+        data['BB_Lower'] = bb.bollinger_lband()
+        data['BB_Middle'] = bb.bollinger_mavg()
+        
+        # 데이터가 충분한지 재확인
+        if len(data) <= ml_config["lookback_window"]:
+            return None
+
+        # 전진분석 검증
+        analyzer = WalkForwardAnalyzer(
+            data, 
+            train_period=200, 
+            test_period=50, 
+            fee=0.0005
+        )
+        results = analyzer.run(strategy_type="ml")
+        total_return = results['total_return'].sum()
+        
+        # 모델 학습 및 저장
+        if total_return > -10000:
+            model = MLPredictor(ml_config["lookback_window"], ml_config["model_type"])
+            model.train(data, epochs=5, batch_size=64) # [Request 1] 파라미터 최적화
+            return (symbol, model, total_return)
+        else:
+            return (symbol, None, total_return)
+            
+    except Exception as e:
+        return (symbol, e, 0)
 
 class AutoTradingBot:
     """자동매매 봇 메인 클래스"""
@@ -85,6 +140,9 @@ class AutoTradingBot:
             TRADING_CONFIG["binance"]["max_position_size"]
         )
         self.binance_portfolio.load_state("data/binance_portfolio.json")
+        
+        # [New] GPU 가속 설정 (LSTM 모델용)
+        self._setup_gpu()
         
         logger.info("3. 머신러닝 모델 초기화")
         # 머신러닝 모델 초기화
@@ -142,6 +200,7 @@ class AutoTradingBot:
         self.crypto_symbols = TRADING_CONFIG["crypto"]["symbols"].copy()
         self.binance_symbols = TRADING_CONFIG["binance"]["symbols"].copy()
         self.oco_monitoring_symbols = set() # [New] OCO 주문으로 서버 관리 중인 종목
+        self.volatility_monitor = {} # [New] 급등락 모니터링용 데이터
         
         # [Request 3] 봇 웜업 상태 (초기 데이터 수집 안정화)
         self.is_ready = False
@@ -175,6 +234,29 @@ class AutoTradingBot:
 
         logger.info("자동매매 봇 초기화 완료")
     
+    def _setup_gpu(self):
+        """TensorFlow GPU 가속 설정"""
+        try:
+            # TensorFlow 로그 레벨 조정 (불필요한 로그 숨김)
+            os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+            
+            import tensorflow as tf
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                try:
+                    # 메모리 증가 허용 (VRAM 전체 할당 방지)
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                    logger.info(f"🚀 GPU 가속 활성화됨: {len(gpus)}개의 GPU 감지")
+                except RuntimeError as e:
+                    logger.warning(f"⚠️ GPU 설정 실패 (이미 초기화됨): {e}")
+            else:
+                logger.info("ℹ️ GPU가 감지되지 않았습니다. CPU 모드로 동작합니다.")
+        except ImportError:
+            pass # TF 미설치 시 조용히 넘어감
+        except Exception as e:
+            logger.warning(f"⚠️ GPU 초기화 중 예외 발생: {e}")
+
     def initialize_apis(self):
         """API 초기화 (설정에 따라 선택적 초기화)"""
         try:
@@ -579,6 +661,26 @@ class AutoTradingBot:
         if getattr(self, 'binance_api', None):
             self.binance_api.health_check()
 
+    def _check_liquidation_safety(self, symbol: str):
+        """[New] 바이낸스 선물 청산 위험 모니터링 및 강제 종료"""
+        if not getattr(self, 'binance_api', None) or not TRADING_CONFIG["binance"].get("futures_enabled", False):
+            return
+
+        risk_data = self.binance_api.get_liquidation_risk(symbol)
+        if not risk_data:
+            return
+
+        dist_pct = risk_data.get('distance_pct', 1.0)
+        # 청산가까지 거리가 20% 미만이면 위험 (강제 청산)
+        if dist_pct < 0.20:
+            msg = f"🚨 [LIQUIDATION_ALERT] {symbol} 청산 위험 감지! (거리: {dist_pct*100:.2f}%) -> 강제 포지션 종료 실행"
+            logger.critical(msg)
+            self._send_telegram_alert(msg)
+            # 시장가로 즉시 전량 청산
+            qty = self.binance_portfolio.positions.get(symbol, 0)
+            if qty > 0:
+                self.binance_api.sell(symbol, qty, is_stop_loss=True)
+
     def _on_binance_error(self, message: str):
         """바이낸스 API 에러 콜백 처리"""
         self._send_telegram_alert(f"🚨 [BINANCE] {message}")
@@ -668,9 +770,204 @@ class AutoTradingBot:
             if os.path.exists(command_file):
                 os.remove(command_file)
 
+    def _update_env_file(self, key: str, value: str):
+        """Update .env file safely"""
+        try:
+            # [수정] 빌드 환경 호환 절대 경로 사용
+            if getattr(sys, 'frozen', False):
+                base_dir = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            env_path = os.path.join(base_dir, ".env")
+            
+            lines = []
+            if os.path.exists(env_path):
+                with open(env_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            
+            key_found = False
+            new_lines = []
+            for line in lines:
+                if line.strip().startswith(f"{key}="):
+                    new_lines.append(f"{key}={value}\n")
+                    key_found = True
+                else:
+                    new_lines.append(line)
+            
+            if not key_found:
+                new_lines.append(f"{key}={value}\n")
+            
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+                
+            logger.info(f"💾 .env 파일 갱신 완료: {key}={value}")
+            
+        except Exception as e:
+            logger.error(f".env 파일 업데이트 오류: {e}")
+
+    def optimize_k_value(self):
+        """K값 자동 최적화 (최근 7일 데이터 기준 승률 분석)"""
+        if not self.crypto_api: return
+
+        logger.info("⚙️ K값 자동 최적화 시작 (최근 7일 데이터 분석)...")
+        
+        # 테스트할 K값 범위
+        k_candidates = [0.4, 0.5, 0.6, 0.7]
+        
+        # 분석 대상 종목 (거래량 상위 및 주요 코인)
+        targets = ["BTC/KRW", "ETH/KRW", "XRP/KRW", "SOL/KRW"]
+        # 현재 포트폴리오나 감시 종목도 포함
+        targets.extend(self.crypto_symbols[:3])
+        targets = list(set(targets))
+        
+        best_k = TRADING_CONFIG["crypto"]["k_value"]
+        best_score = -1.0
+        
+        # 현재 설정 백업
+        original_k = TRADING_CONFIG["crypto"]["k_value"]
+        
+        try:
+            results = {}
+            report_msg = "⚙️ [K-Value 최적화 결과]\n"
+            
+            for k in k_candidates:
+                # 전역 설정 임시 변경 (TechnicalStrategy가 참조함)
+                TRADING_CONFIG["crypto"]["k_value"] = k
+                
+                total_trades = 0
+                total_wins = 0
+                
+                for symbol in targets:
+                    # 최근 7일 데이터 확보 (15분봉 기준 약 672개 -> 넉넉히 1000개)
+                    df = self.crypto_api.get_ohlcv(symbol, timeframe="15m", count=1000)
+                    if df.empty or len(df) < 100: continue
+                    
+                    # 최근 7일 구간 슬라이싱
+                    test_len = min(len(df), 700)
+                    test_data = df.tail(test_len)
+                    
+                    # 백테스팅 실행 (TechnicalStrategy - Breakout)
+                    # WalkForwardAnalyzer의 내부 로직 활용
+                    analyzer = WalkForwardAnalyzer(
+                        test_data, 
+                        train_period=20, # 최소 학습 기간
+                        test_period=len(test_data)-50, # 전체 통으로 테스트
+                        fee=0.0005,
+                        slippage=0.001
+                    )
+                    
+                    # 전략 객체 생성 (변경된 K값 적용됨)
+                    strategy = TechnicalStrategy(lookback_window=20)
+                    
+                    # 백테스트 수행
+                    res = analyzer._backtest_period(strategy, test_data, lookback=50)
+                    
+                    if res['trade_count'] > 0:
+                        total_trades += res['trade_count']
+                        total_wins += (res['win_rate'] * res['trade_count'])
+                
+                # 가중 평균 승률 계산
+                avg_win_rate = total_wins / total_trades if total_trades > 0 else 0
+                results[k] = avg_win_rate
+                logger.info(f"   - K={k}: 승률 {avg_win_rate*100:.1f}% (거래 {total_trades}회)")
+                report_msg += f"- K={k}: 승률 {avg_win_rate*100:.1f}% ({total_trades}회)\n"
+                
+                if avg_win_rate > best_score:
+                    best_score = avg_win_rate
+                    best_k = k
+            
+            # 최적값 적용
+            if best_k != original_k:
+                logger.info(f"✅ 최적 K값 발견: {original_k} -> {best_k} (승률 {best_score*100:.1f}%)")
+                report_msg += f"\n🔄 설정 변경: {original_k} -> {best_k}"
+                self._update_env_file("CRYPTO_K_VALUE", str(best_k))
+                TRADING_CONFIG["crypto"]["k_value"] = best_k
+            else:
+                logger.info(f"ℹ️ 현재 K값({original_k})이 최적입니다. (승률 {best_score*100:.1f}%)")
+                report_msg += f"\nℹ️ 현재 설정({original_k}) 유지"
+            
+            # 텔레그램 알림 전송
+            self._send_telegram_alert(report_msg)
+                
+        except Exception as e:
+            logger.error(f"K값 최적화 중 오류: {e}")
+        finally:
+            # 오류 발생 시 원복 (성공 시에는 위에서 이미 best_k로 설정됨)
+            if TRADING_CONFIG["crypto"]["k_value"] != best_k:
+                TRADING_CONFIG["crypto"]["k_value"] = original_k
+
+    def find_best_k(self):
+        """
+        [미니 전진분석] 매 시간 최근 데이터를 복기하여 최적의 K값 탐색
+        로직: 최근 200개 캔들 기준, K값 0.3~0.8 시뮬레이션 -> 최적값 메모리 반영
+        """
+        if not self.crypto_api: return
+
+        logger.info("🧪 [미니 전진분석] 최적 K값 탐색 시작 (최근 200 캔들)...")
+        
+        # 대표 종목으로 테스트 (BTC/KRW)
+        target_symbol = "BTC/KRW"
+        timeframe = TRADING_CONFIG["crypto"].get("timeframe", "15m")
+        
+        # 데이터 수집 (최근 200개 + 지표 계산용 여유분 100개)
+        df = self.crypto_api.get_ohlcv(target_symbol, timeframe=timeframe, count=300)
+        
+        if df.empty or len(df) < 200:
+            logger.warning(f"⚠️ 데이터 부족으로 K값 최적화 스킵 ({len(df)} rows)")
+            return
+
+        # 테스트할 K값 범위 (0.3 ~ 0.8, 0.05 단위)
+        k_candidates = [round(x, 2) for x in np.arange(0.3, 0.81, 0.05)]
+        
+        best_k = 0.6 # 기본값
+        best_return = -float('inf')
+        original_k = TRADING_CONFIG["crypto"]["k_value"]
+        
+        try:
+            # 최근 200개 데이터만 사용 (시장 상황 반영)
+            test_data = df.tail(200)
+            
+            for k in k_candidates:
+                # 설정 임시 변경 (TechnicalStrategy가 참조함)
+                TRADING_CONFIG["crypto"]["k_value"] = k
+                
+                # 백테스팅 시뮬레이션
+                analyzer = WalkForwardAnalyzer(
+                    test_data, 
+                    train_period=20, # 최소 지표 계산 기간
+                    test_period=len(test_data)-20, 
+                    fee=0.0005,
+                    slippage=0.001
+                )
+                strategy = TechnicalStrategy(lookback_window=20)
+                res = analyzer._backtest_period(strategy, test_data, lookback=50)
+                
+                net_return = res['total_return']
+                if net_return > best_return:
+                    best_return = net_return
+                    best_k = k
+            
+            # 결과 적용 및 로그
+            # 가상 자본 1억 기준 수익률 환산
+            return_pct = (best_return / 100000000) * 100
+            
+            if best_return <= 0:
+                logger.info(f"⚠️ [OPTIMIZE] 모든 K값 성과 저조 (최고 {return_pct:.2f}%). 보수적 기본값(0.6) 유지.")
+                TRADING_CONFIG["crypto"]["k_value"] = 0.6
+            else:
+                logger.info(f"✅ [OPTIMIZE] 최적 K값 발견: {best_k} (예상 수익률: {return_pct:.2f}%)")
+                TRADING_CONFIG["crypto"]["k_value"] = best_k
+                # .env 파일은 수정하지 않고 메모리 상에서만 유지
+                
+        except Exception as e:
+            logger.error(f"K값 미니 최적화 중 오류: {e}")
+            TRADING_CONFIG["crypto"]["k_value"] = original_k # 오류 시 원복
+
     def train_ml_model(self):
         """머신러닝 모델 학습"""
         import os
+        import time
         logger.info("머신러닝 모델 학습 시작")
         
         # [추가] models 폴더가 없으면 생성
@@ -696,33 +993,64 @@ class AutoTradingBot:
                           list(set(self.crypto_symbols) | set(self.crypto_portfolio.positions.keys()))
                 skipped_symbols = []
 
+                # [Request 2] 종목 선별: 상위 5개 종목만 집중 학습 (속도 향상)
+                if len(targets) > 5:
+                    targets = targets[:5]
+                    logger.info(f"⚡ 학습 대상 최적화: 상위 5개 종목만 학습합니다. ({', '.join(targets)})")
+
+                # 데이터 수집 (순차적 실행 - API Rate Limit 준수)
+                training_data_map = {}
                 for symbol in targets:
-                    logger.info(f"[{api_name}] {symbol} 모델 학습 중...")
-                    
-                    # 데이터 수집
                     if api_name == "UPBIT":
-                        # [수정] 암호화폐는 ML 학습을 위해 충분한 데이터(예: 2000개)를 요청
-                        # 최소 요구량은 lookback_window로 설정하여 유연하게 처리
                         timeframe = TRADING_CONFIG["crypto"].get("timeframe", "1d")
                         data = api.get_ohlcv(symbol, timeframe, count=2000, min_required_data=ML_CONFIG["lookback_window"])
                     else:
                         timeframe = TRADING_CONFIG["korean_stocks"].get("timeframe", "1d")
                         data = api.get_ohlcv(symbol, timeframe)
                     
-                    # [추가] API 호출 간격 조절 (Rate Limit 방지)
-                    time.sleep(0.5)
-                    
                     if len(data) > ML_CONFIG["lookback_window"]:
-                        # 모델 학습
-                        self.ml_model.train(data)
-                        # [수정] 파일명에서 '/'를 '_'로 치환 (중요!)
-                        safe_symbol = symbol.replace("/", "_")
-                        model_path = f"models/{safe_symbol}_{api_name}_model.pkl"
-                        # 모델 저장
-                        self.ml_model.save_model(model_path)
-                        logger.info(f"[{api_name}] {symbol} 모델 학습 완료")
+                        training_data_map[symbol] = data
                     else:
                         skipped_symbols.append(f"{symbol}({len(data)})")
+                    
+                    time.sleep(0.2) # Rate Limit
+
+                # [Request 3] 병렬 처리 (Multiprocessing)
+                # CPU 코어 수만큼 병렬로 학습 및 검증 수행
+                max_workers = min(os.cpu_count(), len(training_data_map))
+                if max_workers > 0:
+                    logger.info(f"🚀 {max_workers}개의 프로세스로 병렬 학습 시작...")
+                    
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_symbol = {
+                            executor.submit(_train_model_task, sym, df, ML_CONFIG, api_name): sym 
+                            for sym, df in training_data_map.items()
+                        }
+                        
+                        for future in concurrent.futures.as_completed(future_to_symbol):
+                            symbol = future_to_symbol[future]
+                            try:
+                                result_symbol, model, ret = future.result()
+                                if isinstance(model, Exception):
+                                    logger.error(f"[{symbol}] 학습 중 오류: {model}")
+                                elif model:
+                                    # 메인 프로세스에서 저장 (파일 I/O 안전성)
+                                    safe_symbol = symbol.replace("/", "_")
+                                    model_path = f"models/{safe_symbol}_{api_name}_model.pkl"
+                                    
+                                    # [Request] 모델 저장 시 압축 적용 (용량 최적화)
+                                    compress_level = 3
+                                    if model.model_type == "lstm":
+                                        model.model.save(model_path.replace(".pkl", ".h5"))
+                                        joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
+                                    else:
+                                        joblib.dump(model.model, model_path, compress=compress_level)
+                                        joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
+                                    logger.info(f"✅ [{symbol}] 모델 학습 및 저장 완료 (검증 수익: {ret:,.0f}, 압축 적용)")
+                                else:
+                                    logger.warning(f"⚠️ [{symbol}] 전진분석 결과 저조(수익: {ret:,.0f}). 학습 모델을 저장하지 않습니다.")
+                            except Exception as e:
+                                logger.error(f"[{symbol}] 병렬 처리 결과 수신 중 오류: {e}")
                 
                 if skipped_symbols:
                     logger.warning(f"⚠️ [{api_name}] 데이터 부족으로 학습 스킵 ({len(skipped_symbols)}종목): {', '.join(skipped_symbols)}")
@@ -742,13 +1070,18 @@ class AutoTradingBot:
         # 2. 시장 분석 및 전략 자동 업데이트
         self.recommend_strategy(auto_update=True)
         
-        # 3. 동적 설정(K값 등) 다시 로드
+        # 3. K값 자동 최적화 (매일 자정 갱신)
+        self.optimize_k_value()
+        
+        # 4. 동적 설정(K값 등) 다시 로드
         self.load_dynamic_config()
         
-        # 4. 전략 성과 리포트 생성 및 알림
+        # 5. 전략 성과 리포트 생성 및 알림
         if self.report_manager:
             self.report_manager.generate_daily_report("BTC/KRW")
-            self.report_manager.report_portfolio_status(self.crypto_portfolio)
+            self.report_manager.report_portfolio_status(self.crypto_portfolio, "UPBIT", api=self.crypto_api)
+            if getattr(self, 'binance_portfolio', None) and getattr(self, 'binance_api', None):
+                self.report_manager.report_portfolio_status(self.binance_portfolio, "BINANCE", api=self.binance_api)
         
         logger.info("=" * 60)
         logger.info("✅ 일일 루틴 완료. 최적화된 전략으로 매매를 지속합니다.")
@@ -1065,6 +1398,9 @@ class AutoTradingBot:
     def _execute_sell(self, api, portfolio, risk_manager, symbol, current_price, exit_reason, fee_rate, save_path):
         """매도 실행 공통 로직 (정기 매매 & 실시간 매매 공용)"""
         try:
+            # [New] 거래소 이름 식별
+            exchange_name = "UPBIT" if isinstance(api, UpbitAPI) else "BINANCE" if isinstance(api, BinanceAPI) else "UNKNOWN"
+
             quantity = portfolio.positions.get(symbol, 0)
             if quantity <= 0:
                 return
@@ -1076,7 +1412,7 @@ class AutoTradingBot:
             # 바이낸스는 10달러 등 다름. 설정값 참조
             min_order = 5000 if "KRW" in symbol else 10
             if current_value < min_order:
-                logger.warning(f"⚠️ 매도 금액({current_value:,.0f})이 최소 주문 금액({min_order}) 미만입니다. 매도 불가.")
+                logger.warning(f"[{exchange_name}] ⚠️ 매도 금액({current_value:,.0f})이 최소 주문 금액({min_order}) 미만입니다. 매도 불가.")
                 return
 
             # [수정] 손절 여부 확인
@@ -1084,7 +1420,7 @@ class AutoTradingBot:
             
             # [요청사항 3] 매도 시도 로그 (블랙박스형)
             # 가격은 API 내부에서 결정되므로 current_price로 로깅
-            logger.info(f"[SELL_TRY] 종목: {symbol}, 사유: {exit_reason}, 기준가: {current_price:,.0f}, 수량: {quantity}, 급격한손절: {is_stop_loss}")
+            logger.info(f"[{exchange_name}] [SELL_TRY] 종목: {symbol}, 사유: {exit_reason}, 기준가: {current_price:,.0f}, 수량: {quantity}, 급격한손절: {is_stop_loss}")
             
             # price=None, is_stop_loss 전달 -> 공격적 지정가 또는 시장가(손절시) 실행
             result = api.sell(symbol, quantity, price=None, is_stop_loss=is_stop_loss)
@@ -1105,13 +1441,13 @@ class AutoTradingBot:
                     if current_price > 0:
                         slippage = (current_price - exec_price) / current_price * 100
                         if abs(slippage) >= 0.5:
-                            warn_msg = f"⚠️ [SLIPPAGE] {symbol} 매도 체결가 괴리 경고!\n기준: {current_price:,.0f} -> 체결: {exec_price:,.0f} ({slippage:+.2f}%)"
+                            warn_msg = f"[{exchange_name}] ⚠️ [SLIPPAGE] {symbol} 매도 체결가 괴리 경고!\n기준: {current_price:,.0f} -> 체결: {exec_price:,.0f} ({slippage:+.2f}%)"
                             logger.warning(warn_msg.replace("\n", " "))
                             self._send_telegram_alert(warn_msg)
                 except Exception as e:
                     logger.warning(f"슬리피지 체크 오류: {e}")
 
-                logger.info(f"[PROFIT_REPORT] 실제체결가: {avg_price:,.0f}, 실질수익률: {pnl_percent:+.2f}%, 손익금액: {pnl:+.0f}")
+                logger.info(f"[{exchange_name}] [PROFIT_REPORT] 실제체결가: {avg_price:,.0f}, 실질수익률: {pnl_percent:+.2f}%, 손익금액: {pnl:+.0f}")
 
                 # [로그 상세화] 매도 사유 태그 생성
                 tag = "[매도]"
@@ -1129,16 +1465,24 @@ class AutoTradingBot:
                 portfolio.save_state(save_path)
                 sell_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 logger.warning("="*70)
-                logger.warning(f"{tag} [{symbol.split('/')[1]}] {symbol}")
+                logger.warning(f"[{exchange_name}] {tag} [{symbol.split('/')[1]}] {symbol}")
                 logger.warning(f"시간: {sell_time} | 수량: {quantity}")
                 logger.warning(f"매입가: {entry_price:,.0f}원 | 매도가: {current_price:,.0f}원")
-                logger.warning(f"실현손익: {pnl:,.0f}원 (수익률: {pnl_percent:+.2f}%) | 사유: {exit_reason}")
+                logger.warning(f"실현손익: {pnl:,.0f}원 (수익률: {pnl_percent:+.2f}%) | 사유: {exit_reason}{liq_info}")
                 logger.warning("="*70)
                 
                 # [요청사항 5] 바이낸스 선물 레버리지 정보 추가
                 leverage = None
+                liq_info = ""
                 if "USDT" in symbol and TRADING_CONFIG["binance"].get("futures_enabled", False):
                     leverage = TRADING_CONFIG["binance"].get("leverage", 1)
+                    # [New] 청산 위험도 정보 조회 (바이낸스 API인 경우)
+                    if isinstance(api, BinanceAPI):
+                        risk_data = api.get_liquidation_risk(symbol)
+                        if risk_data:
+                            dist_pct = risk_data.get('distance_pct', 0) * 100
+                            liq_price = risk_data.get('liquidation_price', 0)
+                            liq_info = f" | 청산가: {liq_price:,.4f} (거리: {dist_pct:.2f}%)"
 
                 # [New] 텔레그램 알림 전송
                 if self.report_manager:
@@ -1156,6 +1500,9 @@ class AutoTradingBot:
 
     def _on_realtime_price(self, symbol: str, current_price: float):
         """실시간 가격 업데이트 콜백 (RiskManager 즉시 체크)"""
+        # [New] 급등락 감지 로직 실행
+        self._check_price_volatility(symbol, current_price)
+
         # 보유 종목에 대해서만 리스크 관리 체크
         if symbol in self.crypto_portfolio.positions:
             # 락 획득 시도 (메인 루프와 충돌 방지, blocking=False로 대기 없이 스킵)
@@ -1169,6 +1516,50 @@ class AutoTradingBot:
                     self._execute_sell(self.crypto_api, self.crypto_portfolio, self.crypto_risk_manager, symbol, current_price, exit_reason, TRADING_CONFIG["fees"]["crypto_fee_rate"], "data/crypto_portfolio.json")
             finally:
                 self.trade_lock.release()
+
+    def _check_price_volatility(self, symbol: str, current_price: float):
+        """실시간 급등락 감지 (3분 내 3% 이상 변동 시 알림)"""
+        try:
+            now = time.time()
+            
+            if symbol not in self.volatility_monitor:
+                self.volatility_monitor[symbol] = {
+                    'base_price': current_price,
+                    'base_time': now,
+                    'last_alert_time': 0
+                }
+                return
+
+            data = self.volatility_monitor[symbol]
+            
+            # 기준 시간(3분) 경과 시 기준가 리셋 (완만한 변동은 무시)
+            if now - data['base_time'] > 180:
+                data['base_price'] = current_price
+                data['base_time'] = now
+                return
+
+            # 변동률 계산
+            if data['base_price'] > 0:
+                change_pct = (current_price - data['base_price']) / data['base_price'] * 100
+                
+                # 알림 조건: 3% 이상 변동 AND 쿨타임 10분(600초)
+                if abs(change_pct) >= 3.0:
+                    if now - data['last_alert_time'] > 600:
+                        emoji = "🚀" if change_pct > 0 else "📉"
+                        direction = "급등" if change_pct > 0 else "급락"
+                        
+                        msg = f"{emoji} [{symbol}] 가격 {direction} 경고!\n"
+                        msg += f"현재가: {current_price:,.0f} ({change_pct:+.2f}%)\n"
+                        msg += f"(기준가: {data['base_price']:,.0f} / 3분 내)"
+                        
+                        self._send_telegram_alert(msg)
+                        
+                        # 알림 후 상태 업데이트 (연속 알림 방지)
+                        data['last_alert_time'] = now
+                        data['base_price'] = current_price
+                        data['base_time'] = now
+        except Exception as e:
+            logger.error(f"급등락 체크 오류: {e}")
 
     def _trade_upbit(self):
         """업비트 거래 (KRW)"""
@@ -1193,103 +1584,111 @@ class AutoTradingBot:
             "binance", 
             "data/binance_portfolio.json"
         )
+            
+        # [New] 선물 모드일 경우 청산 리스크 추가 점검
+        if TRADING_CONFIG["binance"].get("futures_enabled", False):
+            for symbol in self.binance_portfolio.positions.keys():
+                self._check_liquidation_safety(symbol)
 
     def _process_crypto_trading(self, api, portfolio, risk_manager, symbols, config_key, save_path):
         """암호화폐 거래 공통 로직"""
         try:
+            exchange_name = "UPBIT" if config_key == "crypto" else "BINANCE"
+
             # 거래량 기반 종목 자동 업데이트 (1시간마다)
             if config_key == "crypto": # 업비트만 자동 업데이트 지원
                 self.update_crypto_symbols()
             
-            # 모니터링 대상: 관심 종목 + 현재 보유 종목 (보유 중인 종목은 순위 밖이라도 관리해야 함)
-            monitoring_symbols = set(symbols) | set(portfolio.positions.keys())
-            
-            logger.debug(f"👀 현재 감시 중인 종목({len(monitoring_symbols)}개): {list(monitoring_symbols)}")
+            # [Phase 1] 보유 종목 관리 (매도/손절/OCO) - 별도 루프 (안전성 강화)
+            # 매수 로직과 분리하여, 매수 중 에러가 발생해도 보유 종목 관리는 멈추지 않도록 함
+            current_positions = list(portfolio.positions.keys())
+            if current_positions:
+                logger.debug(f"[{exchange_name}] 🛡️ 보유 종목 관리 시작 ({len(current_positions)}개): {current_positions}")
 
-            for symbol in monitoring_symbols:
-                # [New] OCO 주문 감시 모드 확인 (바이낸스 현물)
-                if config_key == "binance" and symbol in self.oco_monitoring_symbols:
-                    # 미체결 주문 확인 (주문이 없으면 체결되었거나 취소된 것)
-                    # 미체결 주문 확인 (주문이 없으면 체결되었거나 취소된 것) - API 호출 1회
-                    open_orders = api.get_open_orders(symbol)
-                    if not open_orders:
-                        logger.info(f"🔓 {symbol} OCO 주문 종료(체결/취소) -> 실시간 감시 재개")
-                        self.oco_monitoring_symbols.remove(symbol)
-                        logger.info(f"🔓 {symbol} OCO 주문 종료(체결/취소) 감지")
-                        
-                        # 잔액 확인하여 매도 여부 판단
-                        try:
-                            balance = api.get_balance()
-                            target_coin = symbol.split('/')[0]
-                            available_qty = float(balance.get('free', {}).get(target_coin, 0.0))
-                            
-                            # 보유량이 포트폴리오 수량의 10% 미만이면 전량 매도된 것으로 간주 (먼지 고려)
-                            pf_qty = portfolio.positions.get(symbol, 0)
-                            if pf_qty > 0 and available_qty < (pf_qty * 0.1):
-                                logger.info(f"✅ {symbol} OCO 매도 체결 확인 -> 포트폴리오 정리")
-                                portfolio.remove_position(symbol)
-                                risk_manager.remove_position(symbol)
-                                portfolio.save_state(save_path)
-                                self.oco_monitoring_symbols.remove(symbol)
-                                continue # 루프 종료 (더 이상 보유 종목 아님)
-                            else:
-                                logger.info(f"⚠️ {symbol} OCO 주문 취소됨 (잔고 보유) -> 실시간 감시로 전환")
-                                self.oco_monitoring_symbols.remove(symbol)
-                        except Exception as e:
-                            logger.error(f"OCO 상태 확인 중 오류: {e}")
+            for symbol in current_positions:
+                try:
+                    # [New] OCO 주문 감시 모드 확인 (바이낸스 현물)
+                    if config_key == "binance" and symbol in self.oco_monitoring_symbols:
+                        # 미체결 주문 확인 (주문이 없으면 체결되었거나 취소된 것)
+                        # 미체결 주문 확인 (주문이 없으면 체결되었거나 취소된 것) - API 호출 1회
+                        open_orders = api.get_open_orders(symbol)
+                        if not open_orders:
+                            logger.info(f"[{exchange_name}] 🔓 {symbol} OCO 주문 종료(체결/취소) -> 실시간 감시 재개")
                             self.oco_monitoring_symbols.remove(symbol)
-                    else:
-                        # OCO 대기 중이면 봇의 매도 로직 스킵 (서버가 관리함)
+                            
+                            # 잔액 확인하여 매도 여부 판단
+                            try:
+                                balance = api.get_balance()
+                                target_coin = symbol.split('/')[0]
+                                available_qty = float(balance.get('free', {}).get(target_coin, 0.0))
+                                
+                                # 보유량이 포트폴리오 수량의 10% 미만이면 전량 매도된 것으로 간주 (먼지 고려)
+                                pf_qty = portfolio.positions.get(symbol, 0)
+                                if pf_qty > 0 and available_qty < (pf_qty * 0.1):
+                                    logger.info(f"[{exchange_name}] ✅ {symbol} OCO 매도 체결 확인 -> 포트폴리오 정리")
+                                    portfolio.remove_position(symbol)
+                                    risk_manager.remove_position(symbol)
+                                    portfolio.save_state(save_path)
+                                    continue # 루프 종료 (더 이상 보유 종목 아님)
+                                else:
+                                    logger.info(f"[{exchange_name}] ⚠️ {symbol} OCO 주문 취소됨 (잔고 보유) -> 실시간 감시로 전환")
+                            except Exception as e:
+                                logger.error(f"OCO 상태 확인 중 오류: {e}")
+                        else:
+                            # OCO 대기 중이면 봇의 매도 로직 스킵 (서버가 관리함)
+                            continue
+
+                    # 1. 현재가 조회 (가장 먼저 수행하여 매도 판단 속도 향상)
+                    current_price = api.get_price(symbol)
+                    
+                    # [Fallback] 웹소켓 지연 등으로 현재가가 0이면 REST API로 재조회
+                    if current_price == 0:
+                        try:
+                            ticker = api.get_ticker(symbol)
+                            current_price = float(ticker.get('last', 0))
+                            if current_price > 0:
+                                logger.info(f"[{exchange_name}] ⚠️ {symbol} 웹소켓 가격 0 -> REST API Fallback 성공: {current_price}")
+                        except Exception as e:
+                            logger.warning(f"[{exchange_name}] {symbol} 가격 조회 Fallback 실패: {e}")
+
+                    if current_price == 0:
                         continue
 
-                # 1. 현재가 조회 (가장 먼저 수행하여 매도 판단 속도 향상)
-                current_price = api.get_price(symbol)
-                
-                # [Fallback] 웹소켓 지연 등으로 현재가가 0이면 REST API로 재조회
-                if current_price == 0:
-                    try:
-                        ticker = api.get_ticker(symbol)
-                        current_price = float(ticker.get('last', 0))
-                        if current_price > 0:
-                            logger.info(f"⚠️ {symbol} 웹소켓 가격 0 -> REST API Fallback 성공: {current_price}")
-                    except Exception as e:
-                        logger.warning(f"{symbol} 가격 조회 Fallback 실패: {e}")
-
-                if current_price == 0:
-                    continue
-
-                # 2. 매도 조건 확인 (보유 중일 경우)
-                if symbol in portfolio.positions:
+                    # 2. 매도 조건 확인 (보유 중일 경우)
                     # 2-1. 리스크 관리 (손절/익절) 확인
                     exit_reason = risk_manager.check_exit_conditions(symbol, current_price)
                     
                     # 2-2. 전략적 매도 신호 확인 (이미 리스크 관리로 매도 결정된 경우 건너뜀)
                     if not exit_reason:
                         timeframe = TRADING_CONFIG[config_key].get("timeframe", "1d")
-                        # _get_latest_ohlcv는 api 객체를 사용하도록 수정 필요하지만, 여기선 self.crypto_api에 의존적임.
-                        # 바이낸스용으로 별도 호출하거나 api를 인자로 받도록 수정해야 함.
-                        # 간단히 api.get_ohlcv 직접 호출 (캐싱은 포기하거나 별도 구현)
                         data = api.get_ohlcv(symbol, timeframe) # 캐싱 미적용 (간소화)
-                        if data.empty: continue
-                        signal = self.crypto_strategy.generate_signal(symbol, data, portfolio.current_capital)
-                        if signal and signal.action == "SELL":
-                            exit_reason = f"전략 매도 신호 ({signal.reason})"
+                        if not data.empty:
+                            signal = self.crypto_strategy.generate_signal(symbol, data, portfolio.current_capital)
+                            if signal and signal.action == "SELL":
+                                exit_reason = f"전략 매도 신호 ({signal.reason})"
 
                     if exit_reason:
                         fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if config_key == "binance" else TRADING_CONFIG["fees"]["crypto_fee_rate"]
                         self._execute_sell(api, portfolio, risk_manager, symbol, current_price, exit_reason, fee, save_path)
-                        # 매도했으면 이번 루프에서는 매수 로직 건너뜀
-                        continue
 
-                # 3. 매수 로직 (관심 종목인 경우에만 수행)
-                if symbol in symbols:
-                    # 3-1. 진입 여부 판단을 위한 사전 체크
-                    is_holding = symbol in portfolio.positions
-                    
+                except Exception as e:
+                    logger.error(f"[{exchange_name}] 🚨 보유 종목({symbol}) 관리 중 오류: {e}")
+                    continue
+
+            # [Phase 2] 신규 진입 (매수) - 별도 루프
+            # 보유 중이지 않은 종목만 대상
+            target_symbols = [s for s in symbols if s not in portfolio.positions]
+            
+            for symbol in target_symbols:
+                try:
+                    # 1. 현재가 조회
+                    current_price = api.get_price(symbol)
+                    if current_price == 0: continue
+
+                    # 2. 진입 여부 판단
                     # 신규 진입인데 최대 보유 종목 수 꽉 찼으면 스킵
-                    if not is_holding:
-                        if len(portfolio.positions) >= TRADING_CONFIG[config_key].get("max_positions", 5):
-                            continue
+                    if len(portfolio.positions) >= TRADING_CONFIG[config_key].get("max_positions", 5):
+                        continue
                     
                     # [전략 및 타임프레임 분리]
                     # 비트코인: 4시간봉 (중기 추세)
@@ -1324,12 +1723,12 @@ class AutoTradingBot:
                     # [Request: Data Integrity] 200개 요청했으나 100개 이상이면 전략 실행 허용
                     min_required = 100
                     if len(data) < min_required:
-                        logger.info(f"[SAFE_WAIT] {symbol}: 데이터 부족/타임아웃으로 매매 대기 (수신: {len(data)}개 / 최소: {min_required}개)")
+                        logger.info(f"[{exchange_name}] [SAFE_WAIT] {symbol}: 데이터 부족/타임아웃으로 매매 대기 (수신: {len(data)}개 / 최소: {min_required}개)")
                         continue
                     
                     # [Request 3] 웜업 로직 동기화 - 데이터 로드 확인 로그
                     if not self.is_ready and len(data) >= 200:
-                        logger.info(f"[{symbol}] 웜업 데이터 로드 완료: {len(data)}개 (목표: 200)")
+                        logger.info(f"[{exchange_name}] [{symbol}] 웜업 데이터 로드 완료: {len(data)}개 (목표: 200)")
                     
                     # 신호 생성
                     signal = self.crypto_strategy.generate_signal(
@@ -1343,7 +1742,7 @@ class AutoTradingBot:
                     
                     # [로그 가시성] 진입 보류 시 이유 출력
                     if signal and signal.action == "HOLD":
-                        logger.debug(f"🚫 {symbol} 진입 보류: {signal.reason}")
+                        logger.debug(f"[{exchange_name}] 🚫 {symbol} 진입 보류: {signal.reason}")
                     
                     buy_amount = 0.0
                     is_pyramiding = False
@@ -1354,7 +1753,7 @@ class AutoTradingBot:
                         if signal and signal.action == "BUY":
                             # [검증] 가격 유효성 체크
                             if current_price is None or current_price <= 0:
-                                logger.warning(f"⚠️ {symbol} 현재가 오류({current_price}) -> 매수 스킵")
+                                logger.warning(f"[{exchange_name}] ⚠️ {symbol} 현재가 오류({current_price}) -> 매수 스킵")
                                 continue
 
                             # 사용 가능한 자본을 기준으로 매수 금액 계산
@@ -1367,7 +1766,7 @@ class AutoTradingBot:
                             else:
                                 # [Request 2] 0값 방어 로직 (주문 계산 중단)
                                 if atr <= 0:
-                                    logger.info(f"[WAIT] {symbol}: 변동성 지표(ATR) 수집 중... (ATR: {atr})")
+                                    logger.info(f"[{exchange_name}] [WAIT] {symbol}: 변동성 지표(ATR) 수집 중... (ATR: {atr})")
                                     continue
                                 
                                 capital = portfolio.current_capital
@@ -1380,7 +1779,7 @@ class AutoTradingBot:
                         if config_key == "crypto":
                             # ATR 유효성 검증 (피라미딩은 ATR 필수)
                             if atr is None or atr <= 0:
-                                logger.debug(f"⚠️ {symbol} 피라미딩 스킵: ATR 값 없음({atr})")
+                                logger.debug(f"[{exchange_name}] ⚠️ {symbol} 피라미딩 스킵: ATR 값 없음({atr})")
                                 add_qty = 0.0
                             else:
                                 add_qty = self._calculate_pyramiding_buy(symbol, current_price, atr, current_qty)
@@ -1393,7 +1792,7 @@ class AutoTradingBot:
                     if buy_amount > 0:
                         # [Request 3] 웜업 상태 체크 (매수 차단)
                         if not self.is_ready:
-                            logger.info(f"🛡️ [WARMUP] {symbol} 매수 신호 감지되었으나 웜업 중이라 주문을 생략합니다.")
+                            logger.info(f"[{exchange_name}] 🛡️ [WARMUP] {symbol} 매수 신호 감지되었으나 웜업 중이라 주문을 생략합니다.")
                             continue
 
                         # 매수 금액 계산 (설정값 기반)
@@ -1414,7 +1813,7 @@ class AutoTradingBot:
                             
                             # [안전장치] 잔액 조회 실패 시 스킵
                             if balance is None:
-                                logger.warning(f"⚠️ {symbol} 잔액 조회 실패(None) -> 매수 스킵")
+                                logger.warning(f"[{exchange_name}] ⚠️ {symbol} 잔액 조회 실패(None) -> 매수 스킵")
                                 continue
                                 
                             currency = "KRW" if config_key == "crypto" else "USDT"
@@ -1422,28 +1821,28 @@ class AutoTradingBot:
                             
                             # [안전장치] available_cash None 및 숫자 검증
                             if available_cash is None:
-                                logger.warning(f"⚠️ {symbol} 가용 현금({currency}) 데이터 없음 -> 매수 스킵")
+                                logger.warning(f"[{exchange_name}] ⚠️ {symbol} 가용 현금({currency}) 데이터 없음 -> 매수 스킵")
                                 continue
                             
                             try:
                                 available_cash = float(available_cash)
                             except (ValueError, TypeError):
-                                logger.error(f"⚠️ {symbol} 가용 현금 데이터 형식 오류: {available_cash}")
+                                logger.error(f"[{exchange_name}] ⚠️ {symbol} 가용 현금 데이터 형식 오류: {available_cash}")
                                 continue
 
                             # 1. 잔액 체크
                             if available_cash < buy_amount:
-                                logger.info(f"매수 대기: 잔액 부족 ({symbol}, 가용: {available_cash:,.0f}, 필요: {buy_amount:,.0f})")
+                                logger.info(f"[{exchange_name}] 매수 대기: 잔액 부족 ({symbol}, 가용: {available_cash:,.0f}, 필요: {buy_amount:,.0f})")
                                 
                                 # [New] 예수금 부족 시 전체 미체결 매수 주문 취소하여 현금 확보
-                                logger.info("💰 가용 현금 확보를 위해 타 종목 미체결 매수 주문 취소 시도...")
+                                logger.info(f"[{exchange_name}] 💰 가용 현금 확보를 위해 타 종목 미체결 매수 주문 취소 시도...")
                                 cancelled = api.cancel_all_orders(None, side='buy')
                                 
                                 if cancelled > 0:
                                     time.sleep(0.5) # 잔액 반영 대기
                                     balance = api.get_balance()
                                     available_cash = balance.get("free", {}).get(currency, 0)
-                                    logger.info(f"✨ 미체결 취소 후 가용 현금: {available_cash:,.0f}")
+                                    logger.info(f"[{exchange_name}] ✨ 미체결 취소 후 가용 현금: {available_cash:,.0f}")
                                 
                                 if available_cash < buy_amount:
                                     continue
@@ -1462,7 +1861,7 @@ class AutoTradingBot:
                                 
                                 # [방어 코드] 가격 0 체크 (Division by Zero 방지)
                                 if ask_price <= 0:
-                                    logger.debug(f"⚠️ {symbol} 매수 가격(ask_price)이 0입니다. 매수 스킵.")
+                                    logger.debug(f"[{exchange_name}] ⚠️ {symbol} 매수 가격(ask_price)이 0입니다. 매수 스킵.")
                                     continue
                                 
                                 # 수량 계산: (매수금액) / (가격 * (1 + 수수료율))
@@ -1470,7 +1869,7 @@ class AutoTradingBot:
                                 
                                 denominator = ask_price * (1 + fee_rate)
                                 if denominator == 0:
-                                    logger.debug(f"⚠️ {symbol} 수량 계산 분모가 0입니다. 매수 스킵.")
+                                    logger.debug(f"[{exchange_name}] ⚠️ {symbol} 수량 계산 분모가 0입니다. 매수 스킵.")
                                     continue
                                 
                                 buy_qty = buy_amount / denominator
@@ -1479,12 +1878,12 @@ class AutoTradingBot:
                                 # [로그 상세화] 매수 진입 전 지표 요약
                                 atr_val = signal.atr_value if signal and signal.atr_value else 0.0
                                 conf_score = signal.confidence if signal else 0.0
-                                logger.info(f"🚀 매수 진입 시도: {symbol} | Score: {conf_score:.2f} | ATR: {atr_val:.1f} | Reason: {signal.reason if signal else ''}")
+                                logger.info(f"[{exchange_name}] 🚀 매수 진입 시도: {symbol} | Score: {conf_score:.2f} | ATR: {atr_val:.1f} | Reason: {signal.reason if signal else ''}")
 
                                 if is_pyramiding:
-                                    logger.info(f"🔥 피라미딩(불타기) 주문: {symbol} {buy_qty:.8f}개 @ {ask_price:,.0f}원")
+                                    logger.info(f"[{exchange_name}] 🔥 피라미딩(불타기) 주문: {symbol} {buy_qty:.8f}개 @ {ask_price:,.0f}원")
                                 else:
-                                    logger.info(f"매수 주문 시도: {symbol} {buy_qty:.8f}개 @ {ask_price:,.0f}원")
+                                    logger.info(f"[{exchange_name}] 매수 주문 시도: {symbol} {buy_qty:.8f}개 @ {ask_price:,.0f}원")
                                 
                                 # price=None을 전달하여 공격적 지정가 로직 활성화
                                 result = api.buy(symbol, buy_qty, price=None)
@@ -1502,13 +1901,19 @@ class AutoTradingBot:
                                     
                                     # ATR 기반 추천 손절가가 있으면 사용, 없으면 기본값 사용
                                     risk_manager.set_stop_loss(symbol, current_price, atr_value=atr, custom_stop_loss=signal.suggested_stop_loss)
-                                    # 익절 목표에 왕복 수수료(0.1%) 포함
-                                    risk_manager.set_take_profit(symbol, current_price, fee_rate=fee_rate * 2)
+                                    # [수정] 익절 목표 설정 (ATR 기반 동적 익절 적용)
+                                    risk_manager.set_take_profit(symbol, current_price, fee_rate=fee_rate * 2, atr_value=atr)
                                     portfolio.save_state(save_path)
                                     buy_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                     type_str = "PYRAMIDING" if is_pyramiding else "BUY"
+                                    
+                                    # [New] 레버리지 정보 표시 (바이낸스 선물)
+                                    lev_info = ""
+                                    if config_key == "binance" and TRADING_CONFIG["binance"].get("futures_enabled", False):
+                                        lev_info = f" (Lev: {TRADING_CONFIG['binance'].get('leverage', 1)}x)"
+
                                     logger.warning("="*70)
-                                    logger.warning(f"[{type_str}] [{config_key.upper()}] {symbol}")
+                                    logger.warning(f"[{exchange_name}] [{type_str}] {symbol}{lev_info}")
                                     logger.warning(f"시간: {buy_time} | 수량: {quantity:.8f} | 가격: {current_price:,.0f}원")
                                     logger.warning(f"총액: {buy_amount:,.0f}원")
                                     logger.warning("="*70)
@@ -1543,12 +1948,12 @@ class AutoTradingBot:
                                                     
                                                     # [1단계] 실패 시 보정 후 1회 재시도 (간격 20% 확대)
                                                     if not oco_order:
-                                                        logger.warning(f"⚠️ {symbol} OCO 1차 실패. 간격 재보정(20% 확대) 후 재시도...")
+                                                        logger.warning(f"[{exchange_name}] ⚠️ {symbol} OCO 1차 실패. 간격 재보정(20% 확대) 후 재시도...")
                                                         oco_order = api.create_oco_order(symbol, available_qty, buy_price, tp_pct * 1.2, sl_pct * 1.2)
                                                     
                                                     if oco_order:
                                                         self.oco_monitoring_symbols.add(symbol)
-                                                        logger.info(f"✅ {symbol} OCO 주문 등록 완료")
+                                                        logger.info(f"[{exchange_name}] ✅ {symbol} OCO 주문 등록 완료")
                                                     else:
                                                         # [2, 3, 4단계] 최종 실패 시 대응
                                                         current_p = api.get_price(symbol)
@@ -1556,7 +1961,7 @@ class AutoTradingBot:
                                                         
                                                         # 4단계: 위급 상황 (이미 손절가 이탈) -> 시장가 매도
                                                         if current_p > 0 and current_p < sl_price:
-                                                            logger.warning(f"🚨 {symbol} OCO 실패 & 손절가 이탈({current_p} < {sl_price}) -> 즉시 시장가 매도")
+                                                            logger.warning(f"[{exchange_name}] 🚨 {symbol} OCO 실패 & 손절가 이탈({current_p} < {sl_price}) -> 즉시 시장가 매도")
                                                             sell_res = api.sell(symbol, available_qty, is_stop_loss=True)
                                                             if sell_res:
                                                                 self._send_telegram_alert(f"🚨 {symbol} OCO 실패 및 손절가 이탈로 시장가 매도 실행!")
@@ -1566,19 +1971,19 @@ class AutoTradingBot:
                                                                 portfolio.save_state(save_path)
                                                         else:
                                                             # 2단계 & 3단계: 로컬 감시 전환 + 알림
-                                                            msg = f"⚠️ {symbol} OCO 주문 실패! 봇이 직접 실시간 감시합니다. (Fallback)"
+                                                            msg = f"[{exchange_name}] ⚠️ {symbol} OCO 주문 실패! 봇이 직접 실시간 감시합니다. (Fallback)"
                                                             logger.warning(msg)
                                                             self._send_telegram_alert(msg)
                                         except Exception as oco_e:
-                                            logger.error(f"OCO 주문 처리 중 오류: {oco_e}")
+                                            logger.error(f"[{exchange_name}] OCO 주문 처리 중 오류: {oco_e}")
 
                         except Exception as e:
                             # 잔액 확인 또는 실제 주문 과정에서 발생하는 모든 오류를 여기서 처리
-                            logger.error(f"매수 시도 중 오류 발생 ({symbol}): {e}")
+                            logger.error(f"[{exchange_name}] 매수 시도 중 오류 발생 ({symbol}): {e}")
                             continue
-                
-                # [최적화] 루프 반복마다 잠시 대기 (Rate Limit 회피)
-                time.sleep(0.3)
+                except Exception as e:
+                    logger.error(f"[{exchange_name}] ⚠️ 신규 매수 처리 중 오류 ({symbol}): {e}")
+                    continue
         
         except Exception as e:
             logger.error(f"{config_key} 거래 오류: {e}")
@@ -1729,12 +2134,14 @@ class AutoTradingBot:
             max_instances=1
         )
         
-        # 4시간마다 포트폴리오 현황 텔레그램 전송
-        self.scheduler.add_job(
-            self.send_portfolio_report,
-            'interval',
-            hours=4
-        )
+        # [Request] 정해진 시간에 리포트 전송 (09, 12, 18, 22시)
+        for h in [9, 12, 18, 22]:
+            self.scheduler.add_job(
+                self.send_portfolio_report,
+                'cron',
+                hour=h,
+                minute=0
+            )
         
         # 1분마다 지갑 동기화 (외부 매매 내역 반영)
         self.scheduler.add_job(
@@ -1784,6 +2191,13 @@ class AutoTradingBot:
             minutes=5
         )
         
+        # [Request 2] 전진분석 주기 변경: 4시간마다 실행 (부하 감소)
+        self.scheduler.add_job(
+            self.find_best_k,
+            'cron',
+            hour='*/4', minute=0
+        )
+        
         # 스케줄러 시작
         self.scheduler.start()
         
@@ -1802,7 +2216,9 @@ class AutoTradingBot:
     def send_portfolio_report(self):
         """포트폴리오 현황 텔레그램 전송"""
         if self.report_manager:
-            self.report_manager.report_portfolio_status(self.crypto_portfolio)
+            self.report_manager.report_portfolio_status(self.crypto_portfolio, "UPBIT", api=self.crypto_api)
+            if getattr(self, 'binance_portfolio', None) and getattr(self, 'binance_api', None):
+                self.report_manager.report_portfolio_status(self.binance_portfolio, "BINANCE", api=self.binance_api)
 
     def stop(self):
         """봇 종료"""

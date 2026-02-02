@@ -222,9 +222,13 @@ def build_exe():
             f.write("#CRYPTO_TRAILING_STOP=0.008\n")
             f.write("#CRYPTO_TIMEFRAME=1m\n")
             
-            f.write("\n# 4. API 활성화 설정 (True/False)\n")
+            f.write("\n# 4. 머신러닝 설정\n")
+            f.write("# 사용 가능한 모델: lstm, random_forest, xgboost\n")
+            f.write("MODEL_TYPE=lstm\n")
+            
+            f.write("\n# 5. API 활성화 설정 (True/False)\n")
             f.write("ENABLE_UPBIT=True\n")
-            f.write("ENABLE_BINANCE=False\n")
+            f.write("ENABLE_BINANCE=True\n")
             f.write("ENABLE_SHINHAN=False\n")
             f.write("ENABLE_KIWOOM=False\n")
             f.write("ENABLE_DAISHIN=False\n")

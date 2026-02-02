@@ -49,14 +49,27 @@ class RiskManager:
         self.highest_prices[symbol] = entry_price
         return stop_loss_price
     
-    def set_take_profit(self, symbol: str, entry_price: float, fee_rate: float = 0.0) -> float:
+    def set_take_profit(self, symbol: str, entry_price: float, fee_rate: float = 0.0, atr_value: float = 0.0) -> float:
         """수익 실현 가격 설정 (수수료 고려)"""
+        target_pct = self.take_profit_percent
+
+        # [New] 동적 익절 로직 (ATR 기반 가변 익절)
+        if atr_value > 0:
+            # 변동성이 크면 익절 목표 상향 (3 * ATR 기준)
+            dynamic_pct = (atr_value * 3.0) / entry_price
+            
+            # 최소 0.5% ~ 최대 20% 범위 내에서 조정
+            dynamic_pct = max(0.005, min(dynamic_pct, 0.20))
+            
+            logger.info(f"⚖️ [Dynamic TP] {symbol} 변동성(ATR) 반영: 기본 {target_pct*100:.1f}% -> 조정 {dynamic_pct*100:.1f}%")
+            target_pct = dynamic_pct
+
         # 목표 수익률에 수수료율을 더해서 목표가 상향 조정
-        take_profit_price = entry_price * (1 + self.take_profit_percent + fee_rate)
+        take_profit_price = entry_price * (1 + target_pct + fee_rate)
         self.take_profit_prices[symbol] = take_profit_price
         logger.info(
             f"{symbol} 수익 실현 설정: {entry_price} → {take_profit_price} "
-            f"({self.take_profit_percent*100:.1f}%)"
+            f"({target_pct*100:.1f}%)"
         )
         return take_profit_price
     

@@ -40,41 +40,58 @@ class ReportManager:
         except Exception as e:
             logger.error(f"텔레그램 전송 오류: {e}")
 
-    def report_portfolio_status(self, portfolio):
+    def report_portfolio_status(self, portfolio, exchange_name="Crypto", api=None):
         """현재 포트폴리오 상태를 텔레그램으로 전송"""
-        if not portfolio.positions:
-            return
+        # [수정] 보유 종목이 없어도 현금 잔고 보고를 위해 체크 제거
+        
+        # 사용할 API 결정 (전달받은 api가 없으면 기본 self.api 사용)
+        target_api = api if api else self.api
+        
+        # 거래소별 통화 및 소수점 설정
+        is_binance = "BINANCE" in exchange_name.upper()
+        currency = "USDT" if is_binance else "원"
+        precision = 2 if is_binance else 0
 
         try:
-            message = "📊 *보유 종목 수익률 현황*\n\n"
+            message = f"📊 *[{exchange_name}] 자산 현황 리포트*\n\n"
             total_pnl = 0
             total_value = 0
             
-            for symbol, quantity in portfolio.positions.items():
-                # 현재가 조회
-                current_price = self.api.get_price(symbol)
-                entry_price = portfolio.entry_prices.get(symbol, 0)
-                
-                if entry_price > 0:
-                    pnl_pct = (current_price - entry_price) / entry_price * 100
-                    pnl_amount = (current_price - entry_price) * quantity
+            if portfolio.positions:
+                for symbol, quantity in portfolio.positions.items():
+                    # 현재가 조회
+                    current_price = target_api.get_price(symbol)
+                    entry_price = portfolio.entry_prices.get(symbol, 0)
                     
-                    # 이모지: 수익(빨강/상승), 손실(파랑/하락)
-                    emoji = "🔴" if pnl_pct >= 0 else "🔵"
-                    
-                    message += f"{emoji} *{symbol}*\n"
-                    message += f"   수익률: `{pnl_pct:+.2f}%`\n"
-                    message += f"   평가손익: `{pnl_amount:+,.0f}원`\n"
-                    
-                    total_pnl += pnl_amount
+                    # 가치 합산
                     total_value += current_price * quantity
+                    
+                    if entry_price > 0:
+                        pnl_pct = (current_price - entry_price) / entry_price * 100
+                        pnl_amount = (current_price - entry_price) * quantity
+                        
+                        # 이모지: 수익(빨강/상승), 손실(파랑/하락)
+                        emoji = "🔴" if pnl_pct >= 0 else "🔵"
+                        
+                        message += f"{emoji} *{symbol}*\n"
+                        message += f"   수익률: `{pnl_pct:+.2f}%`\n"
+                        message += f"   평가손익: `{pnl_amount:+,.{precision}f}{currency}`\n"
+                        
+                        total_pnl += pnl_amount
+            else:
+                message += "📌 보유 중인 종목이 없습니다.\n"
             
             # 총 자산 현황 (예수금 포함)
             total_equity = total_value + portfolio.current_capital
             
+            # [New] 금일 실현 손익 조회
+            daily_pnl = portfolio.get_daily_realized_pnl()
+            
             message += "\n" + "-"*20 + "\n"
-            message += f"💰 *총 평가손익*: `{total_pnl:+,.0f}원`\n"
-            message += f"📦 *총 추정자산*: `{total_equity:,.0f}원`"
+            message += f"💵 *보유 현금*: `{portfolio.current_capital:,.{precision}f}{currency}`\n"
+            message += f"📅 *금일 실현손익*: `{daily_pnl:+,.{precision}f}{currency}`\n"
+            message += f"💰 *총 평가손익*: `{total_pnl:+,.{precision}f}{currency}`\n"
+            message += f"📦 *총 추정자산*: `{total_equity:,.{precision}f}{currency}`"
             
             self.send_telegram_message(message)
             

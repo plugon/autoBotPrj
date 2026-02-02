@@ -84,8 +84,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ─────────────────────────────────────────────────────────────────────────
 STRATEGY_PRESETS = {
     "scalping": { # 초단타 (1분봉: 노이즈 대비 손절 여유, 수수료 극복 위한 익절 상향)
-        "take_profit_percent": 0.05,   # 2% -> 5%로 상향 (추세를 더 길게 먹어야 함)
-        "trailing_stop_percent": 0.015, # 0.8% -> 1.5%로 조정 (노이즈에 털리지 않게)
+        "take_profit_percent": 0.02,   # [Modified] 5% -> 2% (현실화)
+        "trailing_stop_percent": 0.01, # [Modified] 1.5% -> 1% (타이트한 관리)
+        "take_profit_percent": 0.02,   # [Modified] 5% -> 2% (현실화)
+        "trailing_stop_percent": 0.01, # [Modified] 1.5% -> 1% (타이트한 관리)
         "timeframe": "1m",
     },
     "short_term": { # 단기 (15분봉: 데이트레이딩, 손익비 1:2 목표)
@@ -196,7 +198,7 @@ TRADING_CONFIG["fees"] = {
 """
 
 ML_CONFIG = {
-    "model_type": "random_forest",      # 사용할 ML 모델: random_forest, xgboost
+    "model_type": os.getenv("MODEL_TYPE", "lstm"),               # 사용할 ML 모델: random_forest, xgboost, lstm
     "lookback_window": 200,             # [수정] 변동성 돌파 일봉 계산을 위해 룩백 기간 상향 (60 -> 200)
     "prediction_horizon": 5,            # 5일 후 가격 예측
     "train_ratio": 0.8,                 # 학습 데이터 80%

@@ -68,17 +68,25 @@ class TurtleBollingerStrategy(TradingStrategy):
             # 6. 거래량 확인
             volume = data['volume'].iloc[-1]
             avg_volume = data['volume'].rolling(20).mean().iloc[-1]
+            
+            # [Safety] 평균 거래량이 0인 경우 방어
+            if avg_volume is None or avg_volume == 0:
+                avg_volume = 1.0
+                
             # [변경] 거래량 가중치 상향 (1.2 -> 1.5배) : 진짜 수급이 들어올 때만 진입
             volume_surge = volume > avg_volume * 1.5
             
             # 디버깅 로그
+            breakout_pct = ((current_price/high_breakout-1)*100) if high_breakout > 0 else 0.0
+            vol_ratio = (volume/avg_volume) if avg_volume > 0 else 0.0
+            
             logger.debug(f"""
 [{symbol}] 시장 상황:
   - 가격: {current_price:,.0f}
-  - 돌파선: {high_breakout:,.0f} (현재가 {((current_price/high_breakout-1)*100):+.1f}%)
+  - 돌파선: {high_breakout:,.0f} (현재가 {breakout_pct:+.1f}%)
   - BB: 하단 {bb_lower:,.0f} / 중간 {bb_middle:,.0f} / 상단 {bb_upper:,.0f}
   - RSI: {rsi:.1f}, ADX: {adx:.1f}
-  - 거래량: {volume:,.0f} (평균 대비 {(volume/avg_volume):.1f}x)
+  - 거래량: {volume:,.0f} (평균 대비 {vol_ratio:.1f}x)
             """)
             
             # ========== 매수 조건 평가 ==========
@@ -129,7 +137,8 @@ class TurtleBollingerStrategy(TradingStrategy):
             if signal_action == "HOLD":
                 # [변경] 구체적인 미달 사유 로깅
                 fail_reasons = []
-                if not volume_surge: fail_reasons.append(f"거래량부족({volume/avg_volume:.1f}x)")
+                vol_ratio_log = (volume/avg_volume) if avg_volume > 0 else 0.0
+                if not volume_surge: fail_reasons.append(f"거래량부족({vol_ratio_log:.1f}x)")
                 if rsi >= 45: fail_reasons.append(f"RSI높음({rsi:.1f})")
                 if adx <= 15: fail_reasons.append(f"추세약함(ADX {adx:.1f})")
                 if current_price <= high_breakout: fail_reasons.append(f"돌파실패({current_price:,.0f}<{high_breakout:,.0f})")
@@ -159,7 +168,7 @@ class TurtleBollingerStrategy(TradingStrategy):
                 # 가장 높은 손절가 선택 (타이트한 손절)
                 suggested_stop_loss = max(atr_stop, low_stop, bb_stop)
                 
-                stop_pct = ((current_price - suggested_stop_loss) / current_price) * 100
+                stop_pct = ((current_price - suggested_stop_loss) / current_price) * 100 if current_price > 0 else 0.0
                 logger.info(f"  → 진입: {current_price:,.0f}, 손절: {suggested_stop_loss:,.0f} (-{stop_pct:.1f}%)")
 
             return Signal(

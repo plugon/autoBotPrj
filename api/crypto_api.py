@@ -714,6 +714,41 @@ class BinanceAPI(BaseAPI):
         self.exchange = None
         logger.info("바이낸스 API 연결 종료")
 
+    def set_leverage(self, symbol: str, leverage: int):
+        """[New] 레버리지 설정"""
+        try:
+            # ccxt unified method
+            self.exchange.set_leverage(leverage, symbol)
+            logger.info(f"⚙️ [BINANCE] {symbol} 레버리지 설정: {leverage}x")
+        except Exception as e:
+            logger.warning(f"{symbol} 레버리지 설정 실패: {e}")
+
+    def set_position_mode(self, hedge_mode: bool = False):
+        """[New] 포지션 모드 설정 (Hedge Mode vs One-way Mode)"""
+        try:
+            # binance specific
+            self.exchange.set_position_mode(hedge_mode)
+            mode = "Hedge" if hedge_mode else "One-way"
+            logger.info(f"⚙️ [BINANCE] 포지션 모드 설정: {mode}")
+        except Exception as e:
+            logger.debug(f"포지션 모드 설정 실패/스킵: {e}")
+
+    def get_liquidation_risk(self, symbol: str) -> Dict:
+        """[New] 청산 위험도 조회 (청산가 거리 모니터링)"""
+        try:
+            positions = self.exchange.fetch_positions([symbol])
+            for p in positions:
+                if p['symbol'] == symbol:
+                    liq_price = float(p.get('liquidationPrice') or 0)
+                    mark_price = float(p.get('markPrice') or 0)
+                    if liq_price > 0 and mark_price > 0:
+                        # 청산가와의 거리 비율 (Distance to Liquidation)
+                        distance_pct = abs(mark_price - liq_price) / mark_price
+                        return {'distance_pct': distance_pct, 'liquidation_price': liq_price}
+        except Exception as e:
+            logger.error(f"{symbol} 청산 리스크 조회 오류: {e}")
+        return {}
+
     def _ensure_market_settings(self, symbol: str):
         """[요청사항 1, 2] 격리 마진 및 레버리지 설정 (하드캡 적용)"""
         # [요청사항 4] 선물 전용 로직 보호 (현물 모드 시 실행 차단)

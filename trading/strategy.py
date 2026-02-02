@@ -87,14 +87,15 @@ class MLStrategy(TradingStrategy):
             # 터틀 트레이딩 유닛 계산 (1% 리스크)
             suggested_qty = 0.0
             if current_capital > 0:
-                # [수정] ATR 0일 경우 임시 변동성(2%) 적용 (Division by Zero 방지)
-                calc_atr = atr
-                if calc_atr <= 0:
-                    calc_atr = current_price * 0.02
+                # [Request] ATR 최소값 보정 (0.1% 강제) - Zero Division 방지
+                min_atr = current_price * 0.001
+                safe_atr = max(atr if atr else 0.0, min_atr)
                 
-                stop_dist = calc_atr * atr_multiplier
+                stop_dist = safe_atr * atr_multiplier
                 
-                if stop_dist > 0:
+                if stop_dist <= 0:
+                    logger.debug(f"[DEBUG] ⚠️ {symbol} 변동성(ATR)이 0이라 수량 계산을 중단합니다.")
+                else:
                     # Qty = (Capital * 0.01) / (ATR * Multiplier)
                     risk_amt = current_capital * 0.01
                     suggested_qty = risk_amt / stop_dist
@@ -356,7 +357,11 @@ class TechnicalStrategy(TradingStrategy):
             # [필터 1] 변동성 필터 (Volatility Filter)
             # ATR이 가격 대비 너무 낮으면(예: 0.5% 미만) 횡보장으로 판단하여 매매를 쉼.
             # 이는 수수료만 나가는 잦은 매매를 방지함.
-            volatility_pct = (atr / current_price) * 100
+            if current_price > 0:
+                volatility_pct = (atr / current_price) * 100
+            else:
+                volatility_pct = 0.0
+                
             if volatility_pct < volatility_threshold:
                 return Signal(symbol=symbol, action="HOLD", confidence=0.0, 
                               reason=f"변동성 낮음 (ATR {volatility_pct:.2f}% < {volatility_threshold}%)")
@@ -373,9 +378,27 @@ class TechnicalStrategy(TradingStrategy):
                 if current_price < ema50:
                     is_downtrend = True
 
-            rsi = self.calculate_rsi(data)
-            macd, signal_line, histogram = self.calculate_macd(data)
-            upper, middle, lower, current_price = self.calculate_bollinger_bands(data)
+            # [Request 4] 지표 계산 캐싱 (Caching)
+            # 데이터프레임에 이미 계산된 지표가 있다면 재사용
+            if 'RSI' in data.columns:
+                rsi = data['RSI'].iloc[-1]
+            else:
+                rsi = self.calculate_rsi(data)
+                
+            if 'MACD' in data.columns and 'MACD_Signal' in data.columns:
+                macd = data['MACD'].iloc[-1]
+                signal_line = data['MACD_Signal'].iloc[-1]
+                histogram = data['MACD_Hist'].iloc[-1]
+            else:
+                macd, signal_line, histogram = self.calculate_macd(data)
+                
+            if 'BB_Upper' in data.columns:
+                upper = data['BB_Upper'].iloc[-1]
+                lower = data['BB_Lower'].iloc[-1]
+                middle = data['BB_Middle'].iloc[-1]
+            else:
+                upper, middle, lower, current_price = self.calculate_bollinger_bands(data)
+            
             obv_trend = self.calculate_obv(data)
             trendline = self.calculate_trendline(data)
             vol_ratio = self.calculate_volume_spike(data)
@@ -571,19 +594,16 @@ class TechnicalStrategy(TradingStrategy):
             # 터틀 트레이딩 유닛 계산 (1% 리스크)
             suggested_qty = 0.0
             if current_capital > 0:
-                # [수정] ATR 0일 경우 임시 변동성(2%) 적용 (Division by Zero 방지)
-                calc_atr = atr
-                if calc_atr <= 0:
-                    calc_atr = current_price * 0.02
-                    logger.debug(f"{symbol} ATR 0 -> 임시 변동성(2%) 적용")
-
-                # [Safety] ATR이 너무 작으면(0.1% 미만) 최소값 보정
+                # [Request] ATR 최소값 보정 (0.1% 강제) - Zero Division 방지
                 min_atr = current_price * 0.001
-                safe_atr = max(calc_atr, min_atr)
+                current_atr = atr if atr is not None else 0.0
+                safe_atr = max(current_atr, min_atr)
                 
                 stop_dist = safe_atr * atr_multiplier
                 
-                if stop_dist > 0:
+                if stop_dist <= 0:
+                    logger.debug(f"[DEBUG] ⚠️ {symbol} 변동성(ATR)이 0이라 수량 계산을 중단합니다.")
+                else:
                     risk_amt = current_capital * 0.01
                     suggested_qty = risk_amt / stop_dist
 

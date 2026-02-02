@@ -213,6 +213,23 @@ class Portfolio:
             'num_trades': len(self.trade_history),
         }
 
+    def get_daily_realized_pnl(self, target_date: datetime = None) -> float:
+        """특정 날짜(기본값: 오늘)의 실현 손익 합계"""
+        if target_date is None:
+            target_date = datetime.now()
+        
+        target_date_str = target_date.strftime("%Y-%m-%d")
+        daily_pnl = 0.0
+        
+        for trade in self.trade_history:
+            if trade['type'] == 'sell':
+                # trade['timestamp']는 datetime 객체임 (load_state에서 변환됨)
+                trade_ts = trade['timestamp']
+                if trade_ts.strftime("%Y-%m-%d") == target_date_str:
+                    daily_pnl += trade.get('pnl', 0.0)
+                    
+        return daily_pnl
+
     def save_state(self, filepath: str):
         """포트폴리오 상태 저장"""
         try:

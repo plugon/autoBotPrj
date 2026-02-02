@@ -94,7 +94,7 @@ class WalkForwardAnalyzer:
     
     def _backtest_period(self, strategy, test_data: pd.DataFrame, lookback: int = 400) -> Dict:
         """테스트 기간 백테스팅"""
-        position = 0  # 1: 롱, 0: 플랫
+        position = 0  # 1: 롱, 0: 플랫, -1: 숏
         entry_price = 0
         entry_cost = 0 # 진입 비용 (수수료 포함)
         quantity = 0   # 보유 수량
@@ -115,7 +115,7 @@ class WalkForwardAnalyzer:
             current_low = test_data['low'].iloc[i]
             symbol = "TEST_SYM"
             
-            # 1. 보유 중일 때 SL/TP 체크 (전 캔들에서 진입했다고 가정하고, 현재 캔들의 고가/저가로 청산 확인)
+            # 1. Long 보유 중일 때 SL/TP 체크
             if position == 1:
                 # 최고가 갱신 (트레일링 스탑용)
                 if current_high > highest_price:
@@ -172,50 +172,96 @@ class WalkForwardAnalyzer:
                     trades.append(pnl)
                     continue
 
+            # 2. Short 보유 중일 때 SL/TP 체크 (공매도)
+            elif position == -1:
+                # Short는 가격이 내려가야 이익 (최저가 갱신 추적 필요하나 여기선 생략)
+                
+                # Stop Loss (가격 상승 시 손절)
+                sl_price = 0.0
+                if self.stop_loss:
+                    sl_price = entry_price * (1 + self.stop_loss)
+                
+                if sl_price > 0 and current_high >= sl_price:
+                    position = 0
+                    exit_price = sl_price * (1 + self.slippage)
+                    # Short 수익: (진입가 - 청산가) * 수량
+                    exit_value = (entry_price - exit_price) * quantity
+                    # 수수료 차감 (진입금액 + 청산금액) * fee
+                    fee_cost = (entry_price * quantity + exit_price * quantity) * self.fee
+                    pnl = exit_value - fee_cost
+                    current_capital += pnl
+                    trades.append(pnl)
+                    continue
+
             # 전략에서 신호 생성
             signal = strategy.generate_signal(symbol, recent_data, current_capital=current_capital)
             
-            # 매수 진입
-            if signal and signal.action == "BUY" and position == 0:
-                # 진입
-                position = 1
-                highest_price = current_price # 최고가 초기화
-                # 매수 체결가: 현재가보다 슬리피지만큼 비싸게 체결된다고 가정
-                entry_price = current_price * (1 + self.slippage)
+            # 매수 신호 (BUY)
+            if signal and signal.action == "BUY":
+                # Short 포지션 청산
+                if position == -1:
+                    position = 0
+                    exit_price = current_price * (1 + self.slippage)
+                    pnl = ((entry_price - exit_price) * quantity) - ((entry_price + exit_price) * quantity * self.fee)
+                    current_capital += pnl
+                    trades.append(pnl)
                 
-                # 수량 결정 (전략 제안 수량 사용)
-                if signal.suggested_quantity > 0:
-                    quantity = signal.suggested_quantity
-                else:
-                    # 제안 수량이 없으면 자본의 20% 투입 가정
-                    quantity = (current_capital * 0.2) / entry_price
+                # Long 진입 (포지션 없을 때)
+                if position == 0:
+                    position = 1
+                    highest_price = current_price # 최고가 초기화
+                    # 매수 체결가: 현재가보다 슬리피지만큼 비싸게 체결된다고 가정
+                    entry_price = current_price * (1 + self.slippage)
+                    
+                    # 수량 결정 (전략 제안 수량 사용)
+                    if signal.suggested_quantity > 0:
+                        quantity = signal.suggested_quantity
+                    else:
+                        # 제안 수량이 없으면 자본의 20% 투입 가정
+                        quantity = (current_capital * 0.2) / entry_price
 
-                # [Safety] 자본금 초과 매수 방지 (레버리지 방지: 현물 100% 제한)
-                max_quantity = current_capital / (entry_price * (1 + self.fee))
-                if quantity > max_quantity:
-                    quantity = max_quantity
+                    # [Safety] 자본금 초과 매수 방지 (레버리지 방지: 현물 100% 제한)
+                    max_quantity = current_capital / (entry_price * (1 + self.fee))
+                    if quantity > max_quantity:
+                        quantity = max_quantity
 
-                # 실제 비용: 체결가 + 수수료
-                entry_cost = (entry_price * quantity) * (1 + self.fee)
-                
-                # [New] 동적 손절가 설정 (전략에서 제안한 값 사용)
-                if signal.suggested_stop_loss:
-                    current_stop_loss_price = signal.suggested_stop_loss
-                else:
-                    current_stop_loss_price = 0.0
+                    # 실제 비용: 체결가 + 수수료
+                    entry_cost = (entry_price * quantity) * (1 + self.fee)
+                    
+                    # [New] 동적 손절가 설정 (전략에서 제안한 값 사용)
+                    if signal.suggested_stop_loss:
+                        current_stop_loss_price = signal.suggested_stop_loss
+                    else:
+                        current_stop_loss_price = 0.0
             
-            elif signal and signal.action == "SELL" and position == 1:
-                # 청산
-                position = 0
-                # 매도 체결가: 현재가보다 슬리피지만큼 싸게 체결된다고 가정
-                exit_price = current_price * (1 - self.slippage)
-                # 실제 수령액: 체결가 - 수수료
-                exit_value = (exit_price * quantity) * (1 - self.fee)
+            # 매도 신호 (SELL)
+            elif signal and signal.action == "SELL":
+                # Long 포지션 청산
+                if position == 1:
+                    position = 0
+                    # 매도 체결가: 현재가보다 슬리피지만큼 싸게 체결된다고 가정
+                    exit_price = current_price * (1 - self.slippage)
+                    # 실제 수령액: 체결가 - 수수료
+                    exit_value = (exit_price * quantity) * (1 - self.fee)
+                    
+                    # 순손익 계산
+                    pnl = exit_value - entry_cost
+                    current_capital += pnl
+                    trades.append(pnl)
                 
-                # 순손익 계산
-                pnl = exit_value - entry_cost
-                current_capital += pnl
-                trades.append(pnl)
+                # Short 진입 (포지션 없을 때 & 양방향 매매)
+                if position == 0:
+                    position = -1
+                    entry_price = current_price * (1 - self.slippage) # 싸게 팔림
+                    
+                    # 수량 결정
+                    if signal.suggested_quantity > 0:
+                        quantity = signal.suggested_quantity
+                    else:
+                        quantity = (current_capital * 0.2) / entry_price
+                    
+                    # 비용 계산 (Short는 증거금 필요)
+                    entry_cost = (entry_price * quantity) * self.fee # 진입 수수료만 기록
         
         # 통계 계산
         if not trades:
