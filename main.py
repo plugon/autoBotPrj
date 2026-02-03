@@ -1076,8 +1076,23 @@ class AutoTradingBot:
                                     # [Request] 모델 저장 시 압축 적용 (용량 최적화)
                                     compress_level = 3
                                     if model.model_type == "lstm":
-                                        model.model.save(model_path.replace(".pkl", ".h5"))
+                                        h5_path = model_path.replace(".pkl", ".h5")
+                                        model.model.save(h5_path)
                                         joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
+                                        
+                                        # [New] ONNX 변환 및 저장
+                                        try:
+                                            import tensorflow as tf
+                                            import tf2onnx
+                                            # 모델 입력 형상 자동 감지
+                                            spec = (tf.TensorSpec(model.model.input_shape, tf.float32, name="input"),)
+                                            onnx_path = model_path.replace(".pkl", ".onnx")
+                                            model_proto, _ = tf2onnx.convert.from_keras(model.model, input_signature=spec, opset=13)
+                                            with open(onnx_path, "wb") as f:
+                                                f.write(model_proto.SerializeToString())
+                                            logger.info(f"📦 [{symbol}] ONNX 변환 저장 완료")
+                                        except Exception as e:
+                                            logger.warning(f"⚠️ [{symbol}] ONNX 변환 실패: {e}")
                                     else:
                                         joblib.dump(model.model, model_path, compress=compress_level)
                                         joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
@@ -1296,6 +1311,12 @@ class AutoTradingBot:
         except Exception as e:
             logger.error(f"한국주식 거래 오류: {e}")
     
+    def sync_with_exchange(self):
+        """거래소 API를 호출해 현재 보유 중인 모든 종목의 실제 평단가와 수량을 가져와서 RiskManager에 강제로 등록"""
+        logger.info("🔄 [Sync] 거래소 데이터와 강제 동기화 시작 (RiskManager 등록)...")
+        self.sync_wallet()
+        logger.info("✅ [Sync] 거래소 동기화 완료.")
+
     def sync_wallet(self):
         """지갑 동기화 (외부 매매 반영)"""
         if self.crypto_api:
@@ -1324,13 +1345,18 @@ class AutoTradingBot:
             for sym, data in api_pos_map.items():
                 qty = data['quantity']
                 price = data['entry_price']
-                if sym not in portfolio.positions or abs(portfolio.positions[sym] - qty) > 0.00000001:
-                    # [요청사항 5] 데이터 무결성 로그
-                    if sym in portfolio.positions:
-                        diff = qty - portfolio.positions[sym]
-                        logger.warning(f"⚠️ [SYNC_WARNING] {sym} 수량 불일치 감지! (장부: {portfolio.positions[sym]} vs 실제: {qty}) -> 차이: {diff:+.8f}")
-                        logger.warning("   👉 실제 잔고 기준으로 봇의 장부를 강제 업데이트합니다.")
-                    
+                
+                should_sync = False
+                if sym not in portfolio.positions:
+                    logger.warning(f"⚠️ [SYNC_WARNING] {sym} 거래소에는 존재하나 봇 포트폴리오에 없는 종목 발견! (수량: {qty}) -> 장부에 신규 등록합니다.")
+                    should_sync = True
+                elif abs(portfolio.positions[sym] - qty) > 0.00000001:
+                    diff = qty - portfolio.positions[sym]
+                    logger.warning(f"⚠️ [SYNC_WARNING] {sym} 수량 불일치 감지! (장부: {portfolio.positions[sym]} vs 실제: {qty}) -> 차이: {diff:+.8f}")
+                    logger.warning("   👉 실제 잔고 기준으로 봇의 장부를 강제 업데이트합니다.")
+                    should_sync = True
+                
+                if should_sync:
                     portfolio.sync_position(sym, qty, price)
                     if sym not in risk_manager.stop_loss_prices:
                         fee_rate = TRADING_CONFIG["fees"].get("binance_fee_rate" if currency == "USDT" else "crypto_fee_rate", 0.001)
@@ -1339,6 +1365,7 @@ class AutoTradingBot:
             
             for sym in list(portfolio.positions.keys()):
                 if sym not in api_pos_map:
+                    logger.warning(f"👻 [SYNC_WARNING] {sym} 유령 포지션 감지! (봇 장부에는 있으나 거래소 잔고 없음) -> 장부에서 삭제합니다.")
                     portfolio.remove_position(sym)
                     risk_manager.remove_position(sym)
             
@@ -1487,7 +1514,9 @@ class AutoTradingBot:
                 # [로그 상세화] 매도 사유 태그 생성
                 tag = "[매도]"
                 reason_lower = str(exit_reason).lower()
-                if "stop_loss" in reason_lower or "손절" in reason_lower:
+                if "emergency" in reason_lower:
+                    tag = "🚨 [긴급매도]"
+                elif "stop_loss" in reason_lower or "손절" in reason_lower:
                     tag = "[손절실행]"
                 elif "take_profit" in reason_lower or "익절" in reason_lower:
                     tag = "[수익확정]"
@@ -1687,6 +1716,18 @@ class AutoTradingBot:
                             logger.warning(f"[{exchange_name}] {symbol} 가격 조회 Fallback 실패: {e}")
 
                     if current_price == 0:
+                        continue
+
+                    # [New] 비상 손절 체크 (ATR 정보 부재 시 안전장치)
+                    # 다른 PC에서 실행 시 ATR 정보가 없을 수 있으므로, 평단가 대비 -10% 하락 시 무조건 시장가 매도
+                    entry_price = portfolio.entry_prices.get(symbol, 0)
+                    if entry_price > 0 and current_price < (entry_price * 0.9):
+                        exit_reason = "Emergency Stop Loss (Hard Limit -10%)"
+                        logger.warning(f"🚨 {symbol} 비상 손절 발동! (현재가 {current_price:,.0f} < 평단가 {entry_price:,.0f}의 90%)")
+                        self._send_telegram_alert(f"🚨 [긴급 매도] {symbol} 비상 손절(-10%) 발동!\n현재가: {current_price:,.0f}원")
+                        
+                        fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if config_key == "binance" else TRADING_CONFIG["fees"]["crypto_fee_rate"]
+                        self._execute_sell(api, portfolio, risk_manager, symbol, current_price, exit_reason, fee, save_path)
                         continue
 
                     # 2. 매도 조건 확인 (보유 중일 경우)
@@ -2120,7 +2161,7 @@ class AutoTradingBot:
             time.sleep(60)
             
         # 시작 시 지갑 동기화 (기존 보유 종목 로드)
-        self.sync_wallet()
+        self.sync_with_exchange()
         
         # 웹소켓 구독 시작 (관심 종목 + 보유 종목)
         if self.crypto_api and hasattr(self.crypto_api, 'subscribe_websocket'):

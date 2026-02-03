@@ -200,7 +200,9 @@ class ReportManager:
             else:
                 tag = "[매도]"
                 reason_lower = str(reason).lower()
-                if "stop_loss" in reason_lower or "손절" in reason_lower:
+                if "emergency" in reason_lower:
+                    tag = "🚨 [긴급매도]"
+                elif "stop_loss" in reason_lower or "손절" in reason_lower:
                     tag = "💧 [손절실행]"
                 elif "take_profit" in reason_lower or "익절" in reason_lower:
                     tag = "💰 [수익확정]"
