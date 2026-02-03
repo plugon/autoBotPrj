@@ -54,7 +54,7 @@ class RiskManager:
         target_pct = self.take_profit_percent
 
         # [New] 동적 익절 로직 (ATR 기반 가변 익절)
-        if atr_value > 0:
+        if atr_value > 0 and entry_price > 0:
             # 변동성이 크면 익절 목표 상향 (3 * ATR 기준)
             dynamic_pct = (atr_value * 3.0) / entry_price
             
@@ -76,6 +76,10 @@ class RiskManager:
     def check_stop_loss(self, symbol: str, current_price: float) -> bool:
         """손실 제한 확인"""
         if symbol not in self.stop_loss_prices:
+            return False
+        
+        # [Fix] 손절가가 0이거나 음수면 체크 스킵 (유효하지 않은 설정)
+        if self.stop_loss_prices[symbol] <= 0:
             return False
         
         if current_price <= self.stop_loss_prices[symbol]:
@@ -100,6 +104,10 @@ class RiskManager:
                 # 로그는 너무 자주 찍히지 않게 디버그 레벨이나 조건부로 처리하는 것이 좋음
                 # logger.debug(f"{symbol} 강한 추세: 트레일링 스탑이 익절가 상회. 익절 보류.")
                 return False
+
+        # [Fix] 익절가가 0이거나 음수면 체크 스킵 (유효하지 않은 설정)
+        if self.take_profit_prices[symbol] <= 0:
+            return False
 
         if current_price >= self.take_profit_prices[symbol]:
             logger.warning(

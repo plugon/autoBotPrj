@@ -1357,6 +1357,11 @@ class AutoTradingBot:
                     should_sync = True
                 
                 if should_sync:
+                    # [Fix] API 평단가가 0인 경우(바이낸스 현물), 기존 장부가가 있으면 유지
+                    if price == 0 and sym in portfolio.entry_prices and portfolio.entry_prices[sym] > 0:
+                        price = portfolio.entry_prices[sym]
+                        logger.debug(f"ℹ️ [SYNC] {sym} API 평단가 0 -> 기존 장부가({price}) 유지")
+
                     portfolio.sync_position(sym, qty, price)
                     if sym not in risk_manager.stop_loss_prices:
                         fee_rate = TRADING_CONFIG["fees"].get("binance_fee_rate" if currency == "USDT" else "crypto_fee_rate", 0.001)
@@ -1491,7 +1496,10 @@ class AutoTradingBot:
                 portfolio.close_position(symbol, quantity, current_price, fee_rate)
                 
                 pnl = ((current_price - entry_price) * quantity) - (current_price * quantity * fee_rate)
-                pnl_percent = (pnl / (entry_price * quantity)) * 100
+                
+                # [Fix] Zero Division Error 방지
+                denom = entry_price * quantity
+                pnl_percent = (pnl / denom) * 100 if denom > 0 else 0.0
                 
                 # [요청사항 3] 매도 성공 로그 (실제 체결가 및 수익률)
                 # API 결과에 average(평균체결가)가 있으면 사용, 없으면 price 사용
@@ -1721,6 +1729,16 @@ class AutoTradingBot:
                     # [New] 비상 손절 체크 (ATR 정보 부재 시 안전장치)
                     # 다른 PC에서 실행 시 ATR 정보가 없을 수 있으므로, 평단가 대비 -10% 하락 시 무조건 시장가 매도
                     entry_price = portfolio.entry_prices.get(symbol, 0)
+                    
+                    # [Fix] 평단가 0원일 경우 현재가로 대체 (Zero Division 방지)
+                    if entry_price <= 0:
+                        logger.warning(f"[{exchange_name}] ⚠️ {symbol} 평단가 0원 감지 -> 현재가({current_price})로 보정")
+                        entry_price = current_price
+                        portfolio.entry_prices[symbol] = entry_price
+                        if symbol in risk_manager.entry_prices:
+                            risk_manager.entry_prices[symbol] = entry_price
+                        portfolio.save_state(save_path)
+
                     if entry_price > 0 and current_price < (entry_price * 0.9):
                         exit_reason = "Emergency Stop Loss (Hard Limit -10%)"
                         logger.warning(f"🚨 {symbol} 비상 손절 발동! (현재가 {current_price:,.0f} < 평단가 {entry_price:,.0f}의 90%)")
