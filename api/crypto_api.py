@@ -27,6 +27,7 @@ class UpbitAPI(BaseAPI):
         self.price_cache = {}  # 실시간 가격 캐시 {symbol: price}
         self.lock = threading.Lock()
         self.callbacks = [] # 실시간 가격 콜백 리스트
+        self.retry_count = 0 # [New] 재연결 시도 횟수
     
     def connect(self):
         """업비트 API 연결"""
@@ -125,6 +126,9 @@ class UpbitAPI(BaseAPI):
                         symbol = self.code_map[code]
                         with self.lock:
                             self.price_cache[symbol] = price
+                        
+                        # [New] 데이터 수신 성공 시 재연결 카운트 초기화
+                        self.retry_count = 0
                     
                     # 콜백 실행 (RiskManager 등 실시간 처리용)
                     if symbol:
@@ -139,8 +143,11 @@ class UpbitAPI(BaseAPI):
                 
                 # 재연결 시도
                 if self.use_websocket:
-                    logger.info("🔄 WebSocket 재연결 시도 중...")
-                    time.sleep(3)
+                    self.retry_count += 1
+                    wait_time = min(60, 5 * (2 ** (self.retry_count - 1)))
+                    logger.info(f"🔄 WebSocket 재연결 시도 중... ({self.retry_count}회, {wait_time}초 대기)")
+                    time.sleep(wait_time)
+                    
                     try:
                         if self.ws_manager:
                             self.ws_manager.terminate()
@@ -151,7 +158,6 @@ class UpbitAPI(BaseAPI):
                         logger.info("✅ WebSocket 재연결 성공")
                     except Exception as reconnect_e:
                         logger.error(f"❌ WebSocket 재연결 실패: {reconnect_e}")
-                        time.sleep(5)
     
     def get_balance(self) -> Dict:
         """계좌 잔액 조회"""
@@ -672,6 +678,7 @@ class BinanceAPI(BaseAPI):
         self.last_ws_update = 0
         self.error_callbacks = []
         self.leverage_cache = {} # [New] 레버리지 캐시
+        self.retry_count = 0 # [New] 재연결 시도 횟수
     
     def connect(self):
         """바이낸스 API 연결"""
@@ -1288,16 +1295,18 @@ class BinanceAPI(BaseAPI):
             except Exception as e:
                 logger.error(f"❌ [BINANCE] WebSocket 오류: {e}")
                 self._notify_error(f"WebSocket 런타임 오류: {e}")
-                time.sleep(5)
             
             if self.use_websocket:
-                logger.warning("⚠️ [BINANCE] WebSocket 연결 끊김. 5초 후 재연결...")
-                self._notify_error("WebSocket 연결 끊김. 5초 후 재연결 시도...")
+                self.retry_count += 1
+                wait_time = min(60, 5 * (2 ** (self.retry_count - 1)))
+                logger.warning(f"⚠️ [BINANCE] WebSocket 연결 끊김. {wait_time}초 후 재연결... ({self.retry_count}회)")
+                self._notify_error(f"WebSocket 연결 끊김. {wait_time}초 후 재연결 시도...")
                 self.is_ws_ready = False # [요청사항 1] 초기값 대기 상태로 전환
-                time.sleep(5)
+                time.sleep(wait_time)
 
     def _on_open(self, ws):
         logger.info("✅ [BINANCE] WebSocket 연결 수립")
+        self.retry_count = 0 # [New] 연결 성공 시 카운트 리셋
 
     def _on_message(self, ws, message):
         self.last_ws_update = time.time()

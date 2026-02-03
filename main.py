@@ -1957,6 +1957,33 @@ class AutoTradingBot:
                                 # [New] 레버리지 정보 추출
                                 leverage = signal.suggested_leverage if signal else 1
                                 
+                                # [Request] 바이낸스 선물 동적 레버리지 적용 (주문 직전 계산 및 반영)
+                                if config_key == "binance" and TRADING_CONFIG["binance"].get("futures_enabled", False):
+                                    try:
+                                        # ATR(14) 및 장기 평균 ATR(100) 계산 (데이터는 이미 200개 확보됨)
+                                        if len(data) >= 114:
+                                            atr_indicator = AverageTrueRange(data['high'], data['low'], data['close'], window=14)
+                                            atr_series = atr_indicator.average_true_range()
+                                            atr_current = atr_series.iloc[-1]
+                                            atr_avg = atr_series.tail(100).mean()
+                                            
+                                            base_lev = TRADING_CONFIG["binance"].get("leverage", 1)
+                                            # 설정에 없으면 기본 20배 제한
+                                            max_lev_limit = TRADING_CONFIG["binance"].get("max_leverage_limit", 20)
+                                            
+                                            # 전봉 종가 (Panic 감지용)
+                                            prev_close = data['close'].iloc[-2]
+                                            
+                                            # 동적 레버리지 계산
+                                            leverage = risk_manager.get_dynamic_leverage(
+                                                symbol, atr_current, atr_avg, base_lev, max_lev_limit, current_price, prev_close
+                                            )
+                                            
+                                            # 거래소에 레버리지 설정 반영 (주문 전 필수)
+                                            api.set_leverage(symbol, leverage)
+                                    except Exception as lev_e:
+                                        logger.error(f"동적 레버리지 계산 오류: {lev_e}")
+                                
                                 # [로그 상세화] 매수 진입 전 지표 요약
                                 atr_val = signal.atr_value if signal and signal.atr_value else 0.0
                                 conf_score = signal.confidence if signal else 0.0

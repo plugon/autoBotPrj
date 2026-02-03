@@ -15,7 +15,7 @@ def check_and_setup_venv():
         subprocess.check_call([sys.executable, "-m", "venv", "venv"])
         required = ["pip", "setuptools", "wheel", "pyinstaller", "ccxt", "pyupbit", "python-dotenv", 
                     "pandas", "numpy", "tensorflow", "tf2onnx", "onnxruntime", "scikit-learn", 
-                    "psutil", "matplotlib", "streamlit"]
+                    "psutil", "matplotlib", "streamlit", "websocket-client"]
         subprocess.check_call([python_exe, "-m", "pip", "install", "--upgrade"] + required)
 
     subprocess.check_call([python_exe] + sys.argv)
@@ -37,7 +37,7 @@ def build_exe():
     print("\n🤖 1/3: Trading Bot 빌드 시작")
     tf_datas = collect_data_files('tensorflow')
     main_args = ['main.py', '--name=TradingBot', '--onefile', '--clean'] + icon_args
-    for hi in ['tensorflow', 'onnxruntime', 'tf2onnx', 'sklearn.utils._typedefs']:
+    for hi in ['tensorflow', 'onnxruntime', 'tf2onnx', 'sklearn.utils._typedefs', 'websocket']:
         main_args.append(f'--hidden-import={hi}')
     for src, dest in tf_datas:
         main_args.append(f'--add-data={src}{os.pathsep}{dest}')
@@ -58,7 +58,7 @@ def build_exe():
     # 수집된 데이터 추가 (오류 수정 지점)
     for src, dest in st_datas: dash_args.append(f'--add-data={src}{os.pathsep}{dest}')
     for m_src, m_dest in st_meta: dash_args.append(f'--add-data={m_src}{os.pathsep}{m_dest}')
-    for h in st_hidden + ['streamlit.web.cli', 'pyupbit', 'config']:
+    for h in st_hidden + ['streamlit.web.cli', 'pyupbit', 'config', 'websocket']:
         dash_args.append(f'--hidden-import={h}')
     
     PyInstaller.__main__.run(dash_args)
