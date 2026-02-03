@@ -189,3 +189,42 @@ class RiskManager:
             del self.atr_values[symbol]
         if symbol in self.entry_prices:
             del self.entry_prices[symbol]
+
+    def calculate_volatility_index(self, atr_current: float, atr_avg: float) -> float:
+        """변동성 지표(Volatility Index) 계산"""
+        if atr_avg <= 0:
+            return 1.0
+        return atr_current / atr_avg
+
+    def get_dynamic_leverage(self, symbol: str, atr_current: float, atr_avg: float, 
+                             base_leverage: int, max_leverage_limit: int, 
+                             current_price: float, prev_close: float) -> int:
+        """
+        동적 레버리지 계산 (Inverse Volatility Scaling)
+        - Volatility_Index > 1.5: 50% 축소
+        - 0.8 <= Index <= 1.2: 유지
+        - Index < 0.7: 150% 확대 (최대 10배)
+        - Panic Mode: 급락 시 1배
+        """
+        # 1. Panic Mode (Flash Crash 감지: 전봉 대비 5% 이상 하락)
+        if prev_close > 0 and (prev_close - current_price) / prev_close >= 0.05:
+            logger.warning(f"🚨 [PANIC] {symbol} 급락 감지(Flash Crash)! 레버리지를 1배로 고정합니다.")
+            return 1
+
+        vol_index = self.calculate_volatility_index(atr_current, atr_avg)
+        new_leverage = base_leverage
+
+        if vol_index > 1.5:
+            new_leverage = int(base_leverage * 0.5)
+            logger.info(f"📉 [Risk] 고변동성(Idx:{vol_index:.2f}) -> 레버리지 축소 ({base_leverage}x -> {new_leverage}x)")
+        elif vol_index < 0.7:
+            new_leverage = int(base_leverage * 1.5)
+            new_leverage = min(new_leverage, 10) # 알고리즘상 최대 10배 제한
+            logger.info(f"📈 [Risk] 저변동성(Idx:{vol_index:.2f}) -> 레버리지 확대 ({base_leverage}x -> {new_leverage}x)")
+        
+        # Safety Rail: Hard Cap
+        if new_leverage > max_leverage_limit:
+            logger.warning(f"⚠️ [Safety] 계산된 레버리지({new_leverage}x)가 한도({max_leverage_limit}x)를 초과하여 조정합니다.")
+            new_leverage = max_leverage_limit
+            
+        return max(1, new_leverage)
