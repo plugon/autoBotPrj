@@ -8,6 +8,11 @@ import logging
 import time
 import os
 import sys
+
+# [Fix] TensorFlow 로그 노이즈 제거 (oneDNN 최적화 메시지 및 INFO 로그 숨김)
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 import json
 import requests
 import threading
@@ -51,13 +56,19 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 # [Request] sklearn 관련 불필요한 경고 무시 (UserWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
+# [Fix] Keras/TensorFlow 불필요한 경고 무시 (input_shape 관련)
+warnings.filterwarnings("ignore", category=UserWarning, module="keras")
+warnings.filterwarnings("ignore", category=UserWarning, module="tensorflow")
+
 # [Request 3] 병렬 처리를 위한 독립 함수 (Pickling 가능해야 함)
-def _train_model_task(symbol, data, ml_config, api_name):
+def _train_model_task(symbol, data, ml_config, api_name, models_dir):
     """개별 종목 모델 학습 및 전진분석 태스크 (병렬 처리용)"""
     try:
         # [Request 4] 지표 선행 계산 (Caching 효과)
         # 데이터프레임 전체에 대해 지표를 한 번만 계산하여 컬럼에 추가
         import ta
+        import os
+        import joblib
         
         # RSI
         data['RSI'] = ta.momentum.rsi(data['close'], window=14)
@@ -76,7 +87,7 @@ def _train_model_task(symbol, data, ml_config, api_name):
         
         # 데이터가 충분한지 재확인
         if len(data) <= ml_config["lookback_window"]:
-            return None
+            return (symbol, False, 0)
 
         # 전진분석 검증
         analyzer = WalkForwardAnalyzer(
@@ -92,9 +103,36 @@ def _train_model_task(symbol, data, ml_config, api_name):
         if total_return > -10000:
             model = MLPredictor(ml_config["lookback_window"], ml_config["model_type"])
             model.train(data, epochs=5, batch_size=64) # [Request 1] 파라미터 최적화
-            return (symbol, model, total_return)
+            
+            # [Fix] Worker 프로세스에서 직접 저장 (Keras 모델 Pickling 오류 방지)
+            safe_symbol = symbol.replace("/", "_")
+            model_path = os.path.join(models_dir, f"{safe_symbol}_{api_name}_model.pkl")
+            
+            compress_level = 3
+            if model.model_type == "lstm":
+                h5_path = model_path.replace(".pkl", ".h5")
+                model.model.save(h5_path)
+                joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
+                
+                # [New] ONNX 변환 및 저장
+                try:
+                    import tensorflow as tf
+                    import tf2onnx
+                    # 모델 입력 형상 자동 감지
+                    spec = (tf.TensorSpec(model.model.input_shape, tf.float32, name="input"),)
+                    onnx_path = model_path.replace(".pkl", ".onnx")
+                    model_proto, _ = tf2onnx.convert.from_keras(model.model, input_signature=spec, opset=13)
+                    with open(onnx_path, "wb") as f:
+                        f.write(model_proto.SerializeToString())
+                except Exception:
+                    pass
+            else:
+                joblib.dump(model.model, model_path, compress=compress_level)
+                joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
+
+            return (symbol, True, total_return)
         else:
-            return (symbol, None, total_return)
+            return (symbol, False, total_return)
             
     except Exception as e:
         return (symbol, e, 0)
@@ -134,12 +172,19 @@ class AutoTradingBot:
         )
         self.crypto_portfolio.load_state("data/crypto_portfolio.json")
         
-        # [New] 바이낸스 포트폴리오 초기화
-        self.binance_portfolio = Portfolio(
-            TRADING_CONFIG["binance"]["initial_capital"],
-            TRADING_CONFIG["binance"]["max_position_size"]
+        # [New] 바이낸스 현물 포트폴리오
+        self.binance_spot_portfolio = Portfolio(
+            TRADING_CONFIG["binance_spot"]["initial_capital"],
+            TRADING_CONFIG["binance_spot"]["max_position_size"]
         )
-        self.binance_portfolio.load_state("data/binance_portfolio.json")
+        self.binance_spot_portfolio.load_state("data/binance_spot_portfolio.json")
+
+        # [New] 바이낸스 선물 포트폴리오
+        self.binance_futures_portfolio = Portfolio(
+            TRADING_CONFIG["binance_futures"]["initial_capital"],
+            TRADING_CONFIG["binance_futures"]["max_position_size"]
+        )
+        self.binance_futures_portfolio.load_state("data/binance_futures_portfolio.json")
         
         # [New] GPU 가속 설정 (LSTM 모델용)
         self._setup_gpu()
@@ -184,13 +229,20 @@ class AutoTradingBot:
             trailing_stop_percent=TRADING_CONFIG["crypto"].get("trailing_stop_percent", 0.02)
         )
         
-        # [New] 바이낸스 리스크 관리자
-        self.binance_risk_manager = RiskManager(
-            take_profit_percent=TRADING_CONFIG["binance"]["take_profit_percent"],
-            atr_multiplier=TRADING_CONFIG["binance"].get("atr_multiplier", 2.0),
-            trailing_stop_percent=TRADING_CONFIG["binance"].get("trailing_stop_percent", 0.02)
+        # [New] 바이낸스 현물 리스크 관리자
+        self.binance_spot_risk_manager = RiskManager(
+            take_profit_percent=TRADING_CONFIG["binance_spot"]["take_profit_percent"],
+            atr_multiplier=TRADING_CONFIG["binance_spot"].get("atr_multiplier", 2.0),
+            trailing_stop_percent=TRADING_CONFIG["binance_spot"].get("trailing_stop_percent", 0.02)
         )
         
+        # [New] 바이낸스 선물 리스크 관리자
+        self.binance_futures_risk_manager = RiskManager(
+            take_profit_percent=TRADING_CONFIG["binance_futures"]["take_profit_percent"],
+            atr_multiplier=TRADING_CONFIG["binance_futures"].get("atr_multiplier", 2.0),
+            trailing_stop_percent=TRADING_CONFIG["binance_futures"].get("trailing_stop_percent", 0.02)
+        )
+
         # 스케줄러
         self.scheduler = BackgroundScheduler()
         self.trade_lock = threading.Lock()  # 거래 중복 실행 방지 락
@@ -198,7 +250,8 @@ class AutoTradingBot:
         # 거래량 기반 종목 자동 선택
         self.last_volume_update = 0
         self.crypto_symbols = TRADING_CONFIG["crypto"]["symbols"].copy()
-        self.binance_symbols = TRADING_CONFIG["binance"]["symbols"].copy()
+        self.binance_spot_symbols = TRADING_CONFIG["binance_spot"]["symbols"].copy()
+        self.binance_futures_symbols = TRADING_CONFIG["binance_futures"]["symbols"].copy()
         self.oco_monitoring_symbols = set() # [New] OCO 주문으로 서버 관리 중인 종목
         self.volatility_monitor = {} # [New] 급등락 모니터링용 데이터
         
@@ -210,6 +263,7 @@ class AutoTradingBot:
         self.ohlcv_cache = {}
         self.last_ohlcv_fetch = {}
         self.fetch_interval = 180  # 3분 (REST API 호출 빈도 대폭 감소)
+        self.last_log_time = {} # [New] 로그 스로틀링용 타임스탬프 저장
         
         # .env Hot Reload용 타임스탬프
         self.last_env_mtime = 0
@@ -298,7 +352,7 @@ class AutoTradingBot:
                     elif api_name == "upbit":
                         if not UPBIT_API_KEY or "your_" in UPBIT_API_KEY: missing.append("Key")
                         if not UPBIT_API_SECRET or "your_" in UPBIT_API_SECRET: missing.append("Secret")
-                    elif api_name == "binance":
+                    elif "binance" in api_name:
                         if not BINANCE_API_KEY or "your_" in BINANCE_API_KEY: missing.append("Key")
                         if not BINANCE_API_SECRET or "your_" in BINANCE_API_SECRET: missing.append("Secret")
                     
@@ -344,18 +398,31 @@ class AutoTradingBot:
                     logger.error(f"❌ 업비트 API 초기화 실패: {e}")
                     all_apis_connected = False
             
-            # 바이낸스 API (암호화폐)
-            if API_CONFIG.get("binance", False):
+            # 바이낸스 현물 API
+            if API_CONFIG.get("binance_spot", False):
                 try:
                     from config.settings import BINANCE_API_KEY, BINANCE_API_SECRET
-                    self.binance_api = BinanceAPI(BINANCE_API_KEY, BINANCE_API_SECRET)
-                    self.binance_api.connect()
+                    self.binance_spot_api = BinanceAPI(BINANCE_API_KEY, BINANCE_API_SECRET, account_type='spot')
+                    self.binance_spot_api.connect()
                     # [New] 에러 콜백 등록 (연결 끊김 시 즉시 알림)
-                    self.binance_api.add_error_callback(self._on_binance_error)
-                    logger.info("✅ 바이낸스 API 초기화 완료")
+                    self.binance_spot_api.add_error_callback(self._on_binance_error)
+                    logger.info("✅ 바이낸스 현물 API 초기화 완료")
                 except Exception as e:
-                    logger.error(f"❌ 바이낸스 API 초기화 실패: {e}")
-                    self.binance_api = None
+                    logger.error(f"❌ 바이낸스 현물 API 초기화 실패: {e}")
+                    self.binance_spot_api = None
+                    all_apis_connected = False
+
+            # 바이낸스 선물 API
+            if API_CONFIG.get("binance_futures", False):
+                try:
+                    from config.settings import BINANCE_API_KEY, BINANCE_API_SECRET
+                    self.binance_futures_api = BinanceAPI(BINANCE_API_KEY, BINANCE_API_SECRET, account_type='future')
+                    self.binance_futures_api.connect()
+                    self.binance_futures_api.add_error_callback(self._on_binance_error)
+                    logger.info("✅ 바이낸스 선물 API 초기화 완료")
+                except Exception as e:
+                    logger.error(f"❌ 바이낸스 선물 API 초기화 실패: {e}")
+                    self.binance_futures_api = None
                     all_apis_connected = False
             
             if all_apis_connected:
@@ -638,35 +705,37 @@ class AutoTradingBot:
 
     def check_ws_latency(self):
         """웹소켓 데이터 수신 지연 확인"""
-        # 바이낸스
-        if getattr(self, 'binance_api', None) and self.binance_api.use_websocket:
-            last_update = self.binance_api.last_ws_update
-            # 연결된 상태(is_ws_ready)인데 60초 이상 업데이트가 없으면
-            if self.binance_api.is_ws_ready and last_update > 0 and (time.time() - last_update > 60):
-                msg = f"⚠️ [BINANCE] 웹소켓 데이터 수신 1분 이상 지연! (마지막: {int(time.time() - last_update)}초 전)"
-                logger.warning(msg)
-                self._send_telegram_alert(msg)
-                # 지연 심각 시 재연결 시도
-                logger.warning("🔄 지연으로 인한 웹소켓 재연결 시도...")
-                self.binance_api.reconnect_websocket()
+        # 바이낸스 현물/선물 각각 체크
+        for api_name, api in [("SPOT", getattr(self, 'binance_spot_api', None)), 
+                              ("FUTURES", getattr(self, 'binance_futures_api', None))]:
+            if api and api.use_websocket:
+                last_update = api.last_ws_update
+                if api.is_ws_ready and last_update > 0 and (time.time() - last_update > 60):
+                    msg = f"⚠️ [BINANCE_{api_name}] 웹소켓 지연! (마지막: {int(time.time() - last_update)}초 전)"
+                    logger.warning(msg)
+                    self._send_telegram_alert(msg)
+                    api.reconnect_websocket()
 
     def refresh_binance_websocket(self):
         """바이낸스 웹소켓 정기 재연결 (50분 주기)"""
-        if getattr(self, 'binance_api', None) and self.binance_api.use_websocket:
-            logger.info("⏰ [SCHEDULE] 바이낸스 웹소켓 정기 재연결 (50분 주기)")
-            self.binance_api.reconnect_websocket()
+        if getattr(self, 'binance_spot_api', None) and self.binance_spot_api.use_websocket:
+            self.binance_spot_api.reconnect_websocket()
+        if getattr(self, 'binance_futures_api', None) and self.binance_futures_api.use_websocket:
+            self.binance_futures_api.reconnect_websocket()
 
     def check_api_health(self):
         """API 연결 상태 주기적 점검"""
-        if getattr(self, 'binance_api', None):
-            self.binance_api.health_check()
+        if getattr(self, 'binance_spot_api', None):
+            self.binance_spot_api.health_check()
+        if getattr(self, 'binance_futures_api', None):
+            self.binance_futures_api.health_check()
 
     def _check_liquidation_safety(self, symbol: str):
         """[New] 바이낸스 선물 청산 위험 모니터링 및 강제 종료"""
-        if not getattr(self, 'binance_api', None) or not TRADING_CONFIG["binance"].get("futures_enabled", False):
+        if not getattr(self, 'binance_futures_api', None):
             return
 
-        risk_data = self.binance_api.get_liquidation_risk(symbol)
+        risk_data = self.binance_futures_api.get_liquidation_risk(symbol)
         if not risk_data:
             return
 
@@ -677,9 +746,9 @@ class AutoTradingBot:
             logger.critical(msg)
             self._send_telegram_alert(msg)
             # 시장가로 즉시 전량 청산
-            qty = self.binance_portfolio.positions.get(symbol, 0)
+            qty = self.binance_futures_portfolio.positions.get(symbol, 0)
             if qty > 0:
-                self.binance_api.sell(symbol, qty, is_stop_loss=True)
+                self.binance_futures_api.sell(symbol, qty, is_stop_loss=True)
 
     def _on_binance_error(self, message: str):
         """바이낸스 API 에러 콜백 처리"""
@@ -718,14 +787,19 @@ class AutoTradingBot:
             msg += f"• 트레일링스탑: `{c_conf['trailing_stop_percent']*100:.1f}%`\n"
             msg += f"• 최대보유: `{c_conf['max_positions']}종목`\n"
             
-            # Binance Config (if enabled)
-            if getattr(self, 'binance_api', None):
-                b_conf = TRADING_CONFIG["binance"]
-                msg += "\n📊 *[BINANCE] 설정*\n"
+            # Binance Spot
+            if getattr(self, 'binance_spot_api', None):
+                b_conf = TRADING_CONFIG["binance_spot"]
+                msg += "\n📊 *[BINANCE SPOT] 설정*\n"
+                msg += f"• 타임프레임: `{b_conf['timeframe']}`\n"
+                msg += f"• 익절률: `{b_conf['take_profit_percent']*100:.1f}%`\n"
+
+            # Binance Futures
+            if getattr(self, 'binance_futures_api', None):
+                b_conf = TRADING_CONFIG["binance_futures"]
+                msg += "\n📊 *[BINANCE FUTURES] 설정*\n"
                 msg += f"• 타임프레임: `{b_conf['timeframe']}`\n"
                 msg += f"• 레버리지: `{b_conf.get('leverage', 1)}x`\n"
-                msg += f"• 익절률: `{b_conf['take_profit_percent']*100:.1f}%`\n"
-                msg += f"• 손절률: `{b_conf['stop_loss_percent']*100:.1f}%`\n"
             
             self._send_telegram_alert(msg, parse_mode="Markdown")
             logger.info("✅ 설정 요약 텔레그램 전송 완료")
@@ -1005,10 +1079,20 @@ class AutoTradingBot:
         import time
         logger.info("머신러닝 모델 학습 시작")
         
-        # [추가] models 폴더가 없으면 생성
-        if not os.path.exists("models"):
-            os.makedirs("models")
-            logger.info("📂 models 폴더를 생성했습니다.")
+        # [Fix] EXE 실행 시 절대 경로 사용 (models 폴더 위치 보장)
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            
+        models_dir = os.path.join(base_dir, "models")
+        
+        # [New] 사용자가 경로를 명확히 알 수 있도록 로그 출력
+        logger.info(f"📂 모델 파일 저장 경로: {models_dir}")
+        
+        if not os.path.exists(models_dir):
+            os.makedirs(models_dir)
+            logger.info(f"📂 models 폴더를 생성했습니다: {models_dir}")
 
         try:
             # 여러 API에서 데이터 수집
@@ -1058,45 +1142,18 @@ class AutoTradingBot:
                     
                     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
                         future_to_symbol = {
-                            executor.submit(_train_model_task, sym, df, ML_CONFIG, api_name): sym 
+                            executor.submit(_train_model_task, sym, df, ML_CONFIG, api_name, models_dir): sym 
                             for sym, df in training_data_map.items()
                         }
                         
                         for future in concurrent.futures.as_completed(future_to_symbol):
                             symbol = future_to_symbol[future]
                             try:
-                                result_symbol, model, ret = future.result()
-                                if isinstance(model, Exception):
-                                    logger.error(f"[{symbol}] 학습 중 오류: {model}")
-                                elif model:
-                                    # 메인 프로세스에서 저장 (파일 I/O 안전성)
-                                    safe_symbol = symbol.replace("/", "_")
-                                    model_path = f"models/{safe_symbol}_{api_name}_model.pkl"
-                                    
-                                    # [Request] 모델 저장 시 압축 적용 (용량 최적화)
-                                    compress_level = 3
-                                    if model.model_type == "lstm":
-                                        h5_path = model_path.replace(".pkl", ".h5")
-                                        model.model.save(h5_path)
-                                        joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
-                                        
-                                        # [New] ONNX 변환 및 저장
-                                        try:
-                                            import tensorflow as tf
-                                            import tf2onnx
-                                            # 모델 입력 형상 자동 감지
-                                            spec = (tf.TensorSpec(model.model.input_shape, tf.float32, name="input"),)
-                                            onnx_path = model_path.replace(".pkl", ".onnx")
-                                            model_proto, _ = tf2onnx.convert.from_keras(model.model, input_signature=spec, opset=13)
-                                            with open(onnx_path, "wb") as f:
-                                                f.write(model_proto.SerializeToString())
-                                            logger.info(f"📦 [{symbol}] ONNX 변환 저장 완료")
-                                        except Exception as e:
-                                            logger.warning(f"⚠️ [{symbol}] ONNX 변환 실패: {e}")
-                                    else:
-                                        joblib.dump(model.model, model_path, compress=compress_level)
-                                        joblib.dump(model.scaler, model_path.replace(".pkl", "_scaler.pkl"), compress=compress_level)
-                                    logger.info(f"✅ [{symbol}] 모델 학습 및 저장 완료 (검증 수익: {ret:,.0f}, 압축 적용)")
+                                result_symbol, success, ret = future.result()
+                                if isinstance(success, Exception):
+                                    logger.error(f"[{symbol}] 학습 중 오류: {success}")
+                                elif success:
+                                    logger.info(f"✅ [{symbol}] 모델 학습 및 저장 완료 (검증 수익: {ret:,.0f})")
                                 else:
                                     logger.warning(f"⚠️ [{symbol}] 전진분석 결과 저조(수익: {ret:,.0f}). 학습 모델을 저장하지 않습니다.")
                             except Exception as e:
@@ -1130,12 +1187,48 @@ class AutoTradingBot:
         if self.report_manager:
             self.report_manager.generate_daily_report("BTC/KRW")
             self.report_manager.report_portfolio_status(self.crypto_portfolio, "UPBIT", api=self.crypto_api)
-            if getattr(self, 'binance_portfolio', None) and getattr(self, 'binance_api', None):
-                self.report_manager.report_portfolio_status(self.binance_portfolio, "BINANCE", api=self.binance_api)
+            if getattr(self, 'binance_spot_portfolio', None):
+                self.report_manager.report_portfolio_status(self.binance_spot_portfolio, "BINANCE SPOT", api=self.binance_spot_api)
+            if getattr(self, 'binance_futures_portfolio', None):
+                self.report_manager.report_portfolio_status(self.binance_futures_portfolio, "BINANCE FUTURES", api=self.binance_futures_api)
+        
+        # 6. 일별 포트폴리오 상태 저장 (MDD 계산용)
+        self._update_daily_portfolio_history()
         
         logger.info("=" * 60)
         logger.info("✅ 일일 루틴 완료. 최적화된 전략으로 매매를 지속합니다.")
         logger.info("=" * 60)
+
+    def _update_daily_portfolio_history(self):
+        """모든 포트폴리오의 일별 상태 업데이트"""
+        try:
+            # Crypto
+            if self.crypto_api:
+                prices = {}
+                for sym in self.crypto_portfolio.positions:
+                    prices[sym] = self.crypto_api.get_price(sym)
+                self.crypto_portfolio.update_daily_status(prices)
+                self.crypto_portfolio.save_state("data/crypto_portfolio.json")
+                
+            # Binance Spot
+            if getattr(self, 'binance_spot_api', None):
+                prices = {}
+                for sym in self.binance_spot_portfolio.positions:
+                    prices[sym] = self.binance_spot_api.get_price(sym)
+                self.binance_spot_portfolio.update_daily_status(prices)
+                self.binance_spot_portfolio.save_state("data/binance_spot_portfolio.json")
+                
+            # Binance Futures
+            if getattr(self, 'binance_futures_api', None):
+                prices = {}
+                for sym in self.binance_futures_portfolio.positions:
+                    prices[sym] = self.binance_futures_api.get_price(sym)
+                self.binance_futures_portfolio.update_daily_status(prices)
+                self.binance_futures_portfolio.save_state("data/binance_futures_portfolio.json")
+            
+            logger.info("📅 일별 포트폴리오 히스토리 업데이트 완료")
+        except Exception as e:
+            logger.error(f"일별 히스토리 업데이트 오류: {e}")
 
     def cancel_old_orders(self):
         """오래된 미체결 주문 취소 (지정가 주문 미체결 대비)"""
@@ -1217,8 +1310,11 @@ class AutoTradingBot:
             # 1. 업비트 (KRW)
             self._trade_upbit()
             
-            # 2. 바이낸스 (USDT)
-            self._trade_binance()
+            # 2. 바이낸스 현물 (USDT)
+            self._trade_binance_spot()
+
+            # 3. 바이낸스 선물 (USDT)
+            self._trade_binance_futures()
         
         except Exception as e:
             # 429 Too Many Requests 또는 IP Ban 처리
@@ -1242,6 +1338,11 @@ class AutoTradingBot:
                 ("대신증권", self.daishin_api),
             ]
             
+            # [New] 활성화된 API가 없는 경우 경고 출력 (이동 시 .env 누락 확인용)
+            if not any(api for _, api in apis):
+                logger.warning("⚠️ [학습 중단] 연결된 API가 없습니다. .env 파일이 실행 파일과 같은 폴더에 있는지 확인하세요.")
+                return
+
             for api_name, api in apis:
                 if not api:
                     continue
@@ -1322,10 +1423,15 @@ class AutoTradingBot:
         if self.crypto_api:
             self._sync_portfolio(self.crypto_api, self.crypto_portfolio, self.crypto_risk_manager, "KRW", "data/crypto_portfolio.json")
             
-        if getattr(self, 'binance_api', None):
-            # [요청사항 2, 3] 바이낸스 지갑 동기화 시 예외 처리 강화 (현물/선물 모드 자동 적용)
+        if getattr(self, 'binance_spot_api', None):
             try:
-                self._sync_portfolio(self.binance_api, self.binance_portfolio, self.binance_risk_manager, "USDT", "data/binance_portfolio.json")
+                self._sync_portfolio(self.binance_spot_api, self.binance_spot_portfolio, self.binance_spot_risk_manager, "USDT", "data/binance_spot_portfolio.json")
+            except Exception as e:
+                logger.error(f"⚠️ 바이낸스 현물 동기화 실패: {e}")
+
+        if getattr(self, 'binance_futures_api', None):
+            try:
+                self._sync_portfolio(self.binance_futures_api, self.binance_futures_portfolio, self.binance_futures_risk_manager, "USDT", "data/binance_futures_portfolio.json")
             except Exception as e:
                 # -2015 에러 등 발생 시 봇 중단 방지
                 logger.error(f"⚠️ 바이낸스 지갑 동기화 실패 (건너뜀): {e}")
@@ -1422,7 +1528,7 @@ class AutoTradingBot:
                 
         return add_qty
 
-    def _get_latest_ohlcv(self, symbol: str, timeframe: str, current_price: float = None) -> pd.DataFrame:
+    def _get_latest_ohlcv(self, api, symbol: str, timeframe: str, current_price: float = None) -> pd.DataFrame:
         """
         OHLCV 데이터 조회 (캐싱 + 웹소켓 실시간 업데이트)
         REST API 호출 빈도를 줄이고, 웹소켓 현재가를 반영하여 최신 상태 유지
@@ -1440,7 +1546,7 @@ class AutoTradingBot:
             
             # API 호출 전 미세 지연 (429 에러 방지)
             time.sleep(0.2)
-            df = self.crypto_api.get_ohlcv(symbol, timeframe)
+            df = api.get_ohlcv(symbol, timeframe)
             if not df.empty:
                 self.ohlcv_cache[symbol] = df
                 self.last_ohlcv_fetch[symbol] = current_time
@@ -1452,7 +1558,7 @@ class AutoTradingBot:
             
         # 3. 웹소켓 실시간 가격 반영 (메모리 상에서만 업데이트)
         if current_price is None or current_price <= 0:
-            current_price = self.crypto_api.get_price(symbol)
+            current_price = api.get_price(symbol)
             
         if current_price and current_price > 0:
             df = df.copy() # 원본 보존
@@ -1466,7 +1572,7 @@ class AutoTradingBot:
         """매도 실행 공통 로직 (정기 매매 & 실시간 매매 공용)"""
         try:
             # [New] 거래소 이름 식별
-            exchange_name = "UPBIT" if isinstance(api, UpbitAPI) else "BINANCE" if isinstance(api, BinanceAPI) else "UNKNOWN"
+            exchange_name = "UPBIT" if isinstance(api, UpbitAPI) else "BINANCE_FUTURES" if getattr(api, 'is_future', False) else "BINANCE_SPOT"
 
             quantity = portfolio.positions.get(symbol, 0)
             if quantity <= 0:
@@ -1546,8 +1652,8 @@ class AutoTradingBot:
                 # [요청사항 5] 바이낸스 선물 레버리지 정보 추가
                 leverage = None
                 liq_info = ""
-                if "USDT" in symbol and TRADING_CONFIG["binance"].get("futures_enabled", False):
-                    leverage = TRADING_CONFIG["binance"].get("leverage", 1)
+                if getattr(api, 'is_future', False):
+                    leverage = TRADING_CONFIG["binance_futures"].get("leverage", 1)
                     # [New] 청산 위험도 정보 조회 (바이낸스 API인 경우)
                     if isinstance(api, BinanceAPI):
                         risk_data = api.get_liquidation_risk(symbol)
@@ -1645,27 +1751,39 @@ class AutoTradingBot:
             "data/crypto_portfolio.json"
         )
 
-    def _trade_binance(self):
-        """바이낸스 거래 (USDT)"""
-        if not getattr(self, 'binance_api', None): return
+    def _trade_binance_spot(self):
+        """바이낸스 현물 거래"""
+        if not getattr(self, 'binance_spot_api', None): return
         self._process_crypto_trading(
-            self.binance_api, 
-            self.binance_portfolio, 
-            self.binance_risk_manager, 
-            self.binance_symbols, 
-            "binance", 
-            "data/binance_portfolio.json"
+            self.binance_spot_api, 
+            self.binance_spot_portfolio, 
+            self.binance_spot_risk_manager, 
+            self.binance_spot_symbols, 
+            "binance_spot", 
+            "data/binance_spot_portfolio.json"
+        )
+
+    def _trade_binance_futures(self):
+        """바이낸스 선물 거래"""
+        if not getattr(self, 'binance_futures_api', None): return
+        self._process_crypto_trading(
+            self.binance_futures_api, 
+            self.binance_futures_portfolio, 
+            self.binance_futures_risk_manager, 
+            self.binance_futures_symbols, 
+            "binance_futures", 
+            "data/binance_futures_portfolio.json"
         )
             
         # [New] 선물 모드일 경우 청산 리스크 추가 점검
-        if TRADING_CONFIG["binance"].get("futures_enabled", False):
-            for symbol in self.binance_portfolio.positions.keys():
+        if getattr(self, 'binance_futures_api', None):
+            for symbol in self.binance_futures_portfolio.positions.keys():
                 self._check_liquidation_safety(symbol)
 
     def _process_crypto_trading(self, api, portfolio, risk_manager, symbols, config_key, save_path):
         """암호화폐 거래 공통 로직"""
         try:
-            exchange_name = "UPBIT" if config_key == "crypto" else "BINANCE"
+            exchange_name = config_key.upper()
 
             # 거래량 기반 종목 자동 업데이트 (1시간마다)
             if config_key == "crypto": # 업비트만 자동 업데이트 지원
@@ -1680,7 +1798,7 @@ class AutoTradingBot:
             for symbol in current_positions:
                 try:
                     # [New] OCO 주문 감시 모드 확인 (바이낸스 현물)
-                    if config_key == "binance" and symbol in self.oco_monitoring_symbols:
+                    if config_key == "binance_spot" and symbol in self.oco_monitoring_symbols:
                         # 미체결 주문 확인 (주문이 없으면 체결되었거나 취소된 것)
                         # 미체결 주문 확인 (주문이 없으면 체결되었거나 취소된 것) - API 호출 1회
                         open_orders = api.get_open_orders(symbol)
@@ -1744,7 +1862,7 @@ class AutoTradingBot:
                         logger.warning(f"🚨 {symbol} 비상 손절 발동! (현재가 {current_price:,.0f} < 평단가 {entry_price:,.0f}의 90%)")
                         self._send_telegram_alert(f"🚨 [긴급 매도] {symbol} 비상 손절(-10%) 발동!\n현재가: {current_price:,.0f}원")
                         
-                        fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if config_key == "binance" else TRADING_CONFIG["fees"]["crypto_fee_rate"]
+                        fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if "binance" in config_key else TRADING_CONFIG["fees"]["crypto_fee_rate"]
                         self._execute_sell(api, portfolio, risk_manager, symbol, current_price, exit_reason, fee, save_path)
                         continue
 
@@ -1762,7 +1880,7 @@ class AutoTradingBot:
                                 exit_reason = f"전략 매도 신호 ({signal.reason})"
 
                     if exit_reason:
-                        fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if config_key == "binance" else TRADING_CONFIG["fees"]["crypto_fee_rate"]
+                        fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if "binance" in config_key else TRADING_CONFIG["fees"]["crypto_fee_rate"]
                         self._execute_sell(api, portfolio, risk_manager, symbol, current_price, exit_reason, fee, save_path)
 
                 except Exception as e:
@@ -1863,9 +1981,13 @@ class AutoTradingBot:
                             else:
                                 # [Request 2] 0값 방어 로직 (주문 계산 중단)
                                 if atr <= 0:
-                                    logger.info(f"[{exchange_name}] [WAIT] {symbol}: 변동성 지표(ATR) 수집 중... (ATR: {atr})")
-                                    continue
-                                
+                                    # [New] ATR 데이터 부족 시 기본값(1%) 할당 및 로그 스로틀링
+                                    atr = current_price * 0.01
+                                    now = time.time()
+                                    if now - self.last_log_time.get(f"{symbol}_atr", 0) > 60:
+                                        logger.info(f"[{exchange_name}] [WAIT] {symbol}: ATR 지표 부족 -> 기본값(1%) 적용 (ATR: {atr:.2f})")
+                                        self.last_log_time[f"{symbol}_atr"] = now
+
                                 capital = portfolio.current_capital
                                 buy_amount = capital * TRADING_CONFIG[config_key].get("max_position_size", 0.1)
                     else:
@@ -1962,7 +2084,7 @@ class AutoTradingBot:
                                     continue
                                 
                                 # 수량 계산: (매수금액) / (가격 * (1 + 수수료율))
-                                fee_rate = TRADING_CONFIG["fees"]["binance_fee_rate"] if config_key == "binance" else TRADING_CONFIG["fees"]["crypto_fee_rate"]
+                                fee_rate = TRADING_CONFIG["fees"]["binance_fee_rate"] if "binance" in config_key else TRADING_CONFIG["fees"]["crypto_fee_rate"]
                                 
                                 denominator = ask_price * (1 + fee_rate)
                                 if denominator == 0:
@@ -1976,7 +2098,7 @@ class AutoTradingBot:
                                 leverage = signal.suggested_leverage if signal else 1
                                 
                                 # [Request] 바이낸스 선물 동적 레버리지 적용 (주문 직전 계산 및 반영)
-                                if config_key == "binance" and TRADING_CONFIG["binance"].get("futures_enabled", False):
+                                if config_key == "binance_futures":
                                     try:
                                         # ATR(14) 및 장기 평균 ATR(100) 계산 (데이터는 이미 200개 확보됨)
                                         if len(data) >= 114:
@@ -1985,9 +2107,9 @@ class AutoTradingBot:
                                             atr_current = atr_series.iloc[-1]
                                             atr_avg = atr_series.tail(100).mean()
                                             
-                                            base_lev = TRADING_CONFIG["binance"].get("leverage", 1)
+                                            base_lev = TRADING_CONFIG["binance_futures"].get("leverage", 1)
                                             # 설정에 없으면 기본 20배 제한
-                                            max_lev_limit = TRADING_CONFIG["binance"].get("max_leverage_limit", 20)
+                                            max_lev_limit = TRADING_CONFIG["binance_futures"].get("max_leverage_limit", 20)
                                             
                                             # 전봉 종가 (Panic 감지용)
                                             prev_close = data['close'].iloc[-2]
@@ -2036,7 +2158,7 @@ class AutoTradingBot:
                                     
                                     # [New] 레버리지 정보 표시 (바이낸스 선물)
                                     lev_info = ""
-                                    if config_key == "binance" and TRADING_CONFIG["binance"].get("futures_enabled", False):
+                                    if config_key == "binance_futures":
                                         lev_info = f" (Lev: {leverage}x)"
 
                                     logger.warning("="*70)
@@ -2052,7 +2174,7 @@ class AutoTradingBot:
                                         )
                                     
                                     # [New] 바이낸스 현물인 경우 OCO 주문 실행 (안전장치)
-                                    if config_key == "binance" and not TRADING_CONFIG["binance"].get("futures_enabled", False):
+                                    if config_key == "binance_spot":
                                         try:
                                             # 체결 및 잔액 반영 대기
                                             time.sleep(1.0)
@@ -2067,8 +2189,8 @@ class AutoTradingBot:
                                                 buy_price = result.get('average') or result.get('price') or ask_price
                                                 if buy_price:
                                                     buy_price = float(buy_price)
-                                                    tp_pct = TRADING_CONFIG["binance"].get("take_profit_percent", 0.05)
-                                                    sl_pct = TRADING_CONFIG["binance"].get("stop_loss_percent", 0.02)
+                                                    tp_pct = TRADING_CONFIG["binance_spot"].get("take_profit_percent", 0.05)
+                                                    sl_pct = TRADING_CONFIG["binance_spot"].get("stop_loss_percent", 0.02)
                                                     
                                                     # 1차 시도
                                                     oco_order = api.create_oco_order(symbol, available_qty, buy_price, tp_pct, sl_pct)
@@ -2124,26 +2246,103 @@ class AutoTradingBot:
         # 한국주식 포트폴리오
         if self.stock_portfolio.positions:
             logger.info("[한국주식]")
-            stats = self.stock_portfolio.get_statistics({})
+            current_prices = {}
+            stock_apis = [api for api in [self.shinhan_api, self.kiwoom_api, self.daishin_api] if api]
+            if stock_apis:
+                api = stock_apis[0]
+                for symbol in self.stock_portfolio.positions:
+                    try:
+                        price = api.get_price(symbol)
+                        current_prices[symbol] = price
+                    except:
+                        current_prices[symbol] = 0.0
+            
+            stats = self.stock_portfolio.get_statistics(current_prices, use_entry_price_fallback=True)
             logger.info(f"총 자산: {stats['total_value']:,.0f}원")
             logger.info(f"수익/손실: {stats['total_profit_loss']:,.0f}원 "
-                       f"({stats['total_profit_loss_percent']:.2f}%)")
+                       f"({stats['total_profit_loss_percent']:.2f}%) | MDD: {stats.get('mdd', 0):.2f}%")
+            
+            # 종목별 상세 출력
+            for symbol, quantity in self.stock_portfolio.positions.items():
+                current_price = current_prices.get(symbol, 0) or self.stock_portfolio.entry_prices.get(symbol, 0)
+                entry_price = self.stock_portfolio.entry_prices.get(symbol, 0)
+                pnl = (current_price - entry_price) * quantity
+                pnl_pct = (pnl / (entry_price * quantity) * 100) if entry_price > 0 else 0.0
+                emoji = "🔴" if pnl > 0 else "🔵"
+                logger.info(f"  {emoji} {symbol}: 현재가 {current_price:,.0f}원 | 평단가 {entry_price:,.0f}원 | "
+                            f"평가손익 {pnl:,.0f}원 ({pnl_pct:+.2f}%) | 보유 {quantity}주")
         
         # 암호화폐 포트폴리오
         if self.crypto_portfolio.positions:
             logger.info("[암호화폐]")
-            stats = self.crypto_portfolio.get_statistics({})
+            current_prices = {}
+            if self.crypto_api:
+                for symbol in self.crypto_portfolio.positions:
+                    price = self.crypto_api.get_price(symbol)
+                    current_prices[symbol] = price
+            
+            stats = self.crypto_portfolio.get_statistics(current_prices, use_entry_price_fallback=True)
             logger.info(f"총 자산: {stats['total_value']:,.0f}원")
             logger.info(f"수익/손실: {stats['total_profit_loss']:,.0f}원 "
-                       f"({stats['total_profit_loss_percent']:.2f}%)")
+                       f"({stats['total_profit_loss_percent']:.2f}%) | MDD: {stats.get('mdd', 0):.2f}%")
+            
+            # 종목별 상세 출력
+            for symbol, quantity in self.crypto_portfolio.positions.items():
+                current_price = current_prices.get(symbol, 0) or self.crypto_portfolio.entry_prices.get(symbol, 0)
+                entry_price = self.crypto_portfolio.entry_prices.get(symbol, 0)
+                pnl = (current_price - entry_price) * quantity
+                pnl_pct = (pnl / (entry_price * quantity) * 100) if entry_price > 0 else 0.0
+                emoji = "🔴" if pnl > 0 else "🔵"
+                logger.info(f"  {emoji} {symbol}: 현재가 {current_price:,.0f}원 | 평단가 {entry_price:,.0f}원 | "
+                            f"평가손익 {pnl:,.0f}원 ({pnl_pct:+.2f}%) | 보유 {quantity:.4f}")
 
-        # 바이낸스 포트폴리오
-        if getattr(self, 'binance_portfolio', None) and self.binance_portfolio.positions:
-            logger.info("[바이낸스]")
-            stats = self.binance_portfolio.get_statistics({})
+        # 바이낸스 현물
+        if getattr(self, 'binance_spot_portfolio', None) and self.binance_spot_portfolio.positions:
+            logger.info("[바이낸스 현물]")
+            current_prices = {}
+            if getattr(self, 'binance_spot_api', None):
+                for symbol in self.binance_spot_portfolio.positions:
+                    price = self.binance_spot_api.get_price(symbol)
+                    current_prices[symbol] = price
+
+            stats = self.binance_spot_portfolio.get_statistics(current_prices, use_entry_price_fallback=True)
             logger.info(f"총 자산: {stats['total_value']:,.2f} USDT")
             logger.info(f"수익/손실: {stats['total_profit_loss']:,.2f} USDT "
-                       f"({stats['total_profit_loss_percent']:.2f}%)")
+                       f"({stats['total_profit_loss_percent']:.2f}%) | MDD: {stats.get('mdd', 0):.2f}%")
+            
+            # 종목별 상세 출력
+            for symbol, quantity in self.binance_spot_portfolio.positions.items():
+                current_price = current_prices.get(symbol, 0) or self.binance_spot_portfolio.entry_prices.get(symbol, 0)
+                entry_price = self.binance_spot_portfolio.entry_prices.get(symbol, 0)
+                pnl = (current_price - entry_price) * quantity
+                pnl_pct = (pnl / (entry_price * quantity) * 100) if entry_price > 0 else 0.0
+                emoji = "🔴" if pnl > 0 else "🔵"
+                logger.info(f"  {emoji} {symbol}: 현재가 {current_price:,.4f} | 평단가 {entry_price:,.4f} | "
+                            f"평가손익 {pnl:,.2f} ({pnl_pct:+.2f}%) | 보유 {quantity:.4f}")
+
+        # 바이낸스 선물
+        if getattr(self, 'binance_futures_portfolio', None) and self.binance_futures_portfolio.positions:
+            logger.info("[바이낸스 선물]")
+            current_prices = {}
+            if getattr(self, 'binance_futures_api', None):
+                for symbol in self.binance_futures_portfolio.positions:
+                    price = self.binance_futures_api.get_price(symbol)
+                    current_prices[symbol] = price
+
+            stats = self.binance_futures_portfolio.get_statistics(current_prices, use_entry_price_fallback=True)
+            logger.info(f"총 자산: {stats['total_value']:,.2f} USDT")
+            logger.info(f"수익/손실: {stats['total_profit_loss']:,.2f} USDT "
+                       f"({stats['total_profit_loss_percent']:.2f}%) | MDD: {stats.get('mdd', 0):.2f}%")
+            
+            # 종목별 상세 출력
+            for symbol, quantity in self.binance_futures_portfolio.positions.items():
+                current_price = current_prices.get(symbol, 0) or self.binance_futures_portfolio.entry_prices.get(symbol, 0)
+                entry_price = self.binance_futures_portfolio.entry_prices.get(symbol, 0)
+                pnl = (current_price - entry_price) * quantity
+                pnl_pct = (pnl / (entry_price * quantity) * 100) if entry_price > 0 else 0.0
+                emoji = "🔴" if pnl > 0 else "🔵"
+                logger.info(f"  {emoji} {symbol}: 현재가 {current_price:,.4f} | 평단가 {entry_price:,.4f} | "
+                            f"평가손익 {pnl:,.2f} ({pnl_pct:+.2f}%) | 보유 {quantity:.4f}")
     
     def backup_data(self):
         """data 폴더 백업 및 텔레그램 전송"""
@@ -2188,6 +2387,30 @@ class AutoTradingBot:
         except Exception as e:
             logger.error(f"데이터 백업 중 오류: {e}")
 
+    def _warmup_market_data(self):
+        """초기 데이터 강제 로드 (Warm-up)"""
+        logger.info("🔥 [WARMUP] 초기 시장 데이터 수집 시작 (최소 200 캔들)...")
+        
+        # Upbit
+        if self.crypto_api:
+            for symbol in self.crypto_symbols:
+                timeframe = TRADING_CONFIG["crypto"].get("timeframe", "15m")
+                self._get_latest_ohlcv(self.crypto_api, symbol, timeframe)
+        
+        # Binance Spot
+        if getattr(self, 'binance_spot_api', None):
+            for symbol in self.binance_spot_symbols:
+                timeframe = TRADING_CONFIG["binance_spot"].get("timeframe", "15m")
+                self._get_latest_ohlcv(self.binance_spot_api, symbol, timeframe)
+
+        # Binance Futures
+        if getattr(self, 'binance_futures_api', None):
+            for symbol in self.binance_futures_symbols:
+                timeframe = TRADING_CONFIG["binance_futures"].get("timeframe", "15m")
+                self._get_latest_ohlcv(self.binance_futures_api, symbol, timeframe)
+                
+        logger.info("✅ [READY] 모든 지표 계산 및 데이터 수집 완료")
+
     def start(self):
         """봇 시작"""
         logger.info("="*60)
@@ -2214,17 +2437,26 @@ class AutoTradingBot:
             self.crypto_api.subscribe_websocket(all_symbols)
             self.crypto_api.add_price_callback(self._on_realtime_price)
         
-        # [New] 바이낸스 웹소켓 구독 시작
-        if getattr(self, 'binance_api', None) and hasattr(self.binance_api, 'subscribe_websocket'):
-            all_symbols = list(set(self.binance_symbols) | set(self.binance_portfolio.positions.keys()))
-            self.binance_api.subscribe_websocket(all_symbols)
-            self.binance_api.add_price_callback(self._on_realtime_price)
+        # [New] 바이낸스 현물 웹소켓
+        if getattr(self, 'binance_spot_api', None):
+            all_symbols = list(set(self.binance_spot_symbols) | set(self.binance_spot_portfolio.positions.keys()))
+            self.binance_spot_api.subscribe_websocket(all_symbols)
+            self.binance_spot_api.add_price_callback(self._on_realtime_price)
+
+        # [New] 바이낸스 선물 웹소켓
+        if getattr(self, 'binance_futures_api', None):
+            all_symbols = list(set(self.binance_futures_symbols) | set(self.binance_futures_portfolio.positions.keys()))
+            self.binance_futures_api.subscribe_websocket(all_symbols)
+            self.binance_futures_api.add_price_callback(self._on_realtime_price)
         
         # 전략 추천 실행
         self.recommend_strategy()
         
         # 모델 학습
         self.train_ml_model()
+        
+        # [New] 웜업 실행 (데이터 선행 로드)
+        self._warmup_market_data()
         
         # [New] 설정 요약 전송
         self._send_config_summary()
@@ -2347,8 +2579,10 @@ class AutoTradingBot:
         """포트폴리오 현황 텔레그램 전송"""
         if self.report_manager:
             self.report_manager.report_portfolio_status(self.crypto_portfolio, "UPBIT", api=self.crypto_api)
-            if getattr(self, 'binance_portfolio', None) and getattr(self, 'binance_api', None):
-                self.report_manager.report_portfolio_status(self.binance_portfolio, "BINANCE", api=self.binance_api)
+            if getattr(self, 'binance_spot_portfolio', None):
+                self.report_manager.report_portfolio_status(self.binance_spot_portfolio, "BINANCE SPOT", api=self.binance_spot_api)
+            if getattr(self, 'binance_futures_portfolio', None):
+                self.report_manager.report_portfolio_status(self.binance_futures_portfolio, "BINANCE FUTURES", api=self.binance_futures_api)
 
     def stop(self):
         """봇 종료"""
@@ -2370,6 +2604,8 @@ class AutoTradingBot:
             
         self.stock_portfolio.save_state("data/stock_portfolio.json")
         self.crypto_portfolio.save_state("data/crypto_portfolio.json")
+        self.binance_spot_portfolio.save_state("data/binance_spot_portfolio.json")
+        self.binance_futures_portfolio.save_state("data/binance_futures_portfolio.json")
         
         if self.shinhan_api:
             self.shinhan_api.disconnect()

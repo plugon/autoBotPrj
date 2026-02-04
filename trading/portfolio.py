@@ -1,5 +1,6 @@
 import logging
 import pandas as pd
+import numpy as np
 import json
 import os
 from typing import Dict, List
@@ -20,6 +21,8 @@ class Portfolio:
         self.trade_history: List[Dict] = []
         self.pyramiding_info: Dict[str, Dict] = {} # {symbol: {'count': 0, 'last_entry_price': 0.0}}
         self.metadata: Dict = {}  # 전략 정보 등 메타데이터 저장
+        self.daily_history: List[Dict] = [] # [{'date': 'YYYY-MM-DD', 'total_value': float}]
+        self.peak_equity = initial_capital # [New] 실시간 고점 추적용
     
     def add_position(self, symbol: str, quantity: float, entry_price: float, fee_rate: float = 0.0) -> bool:
         """포지션 추가"""
@@ -144,12 +147,16 @@ class Portfolio:
             return 0.0
         return self.positions[symbol] * current_price
     
-    def get_total_value(self, prices: Dict[str, float]) -> float:
+    def get_total_value(self, prices: Dict[str, float], use_entry_price_fallback: bool = False) -> float:
         """포트폴리오 총 가치"""
         total = self.current_capital
         for symbol, quantity in self.positions.items():
-            if symbol in prices:
-                total += quantity * prices[symbol]
+            price = prices.get(symbol, 0.0)
+            if price <= 0 and use_entry_price_fallback:
+                price = self.entry_prices.get(symbol, 0.0)
+            
+            if price > 0:
+                total += quantity * price
         return total
     
     def get_unrealized_pnl(self, symbol: str, current_price: float) -> float:
@@ -192,12 +199,76 @@ class Portfolio:
         
         return pd.DataFrame(summary)
     
-    def get_statistics(self, prices: Dict[str, float]) -> Dict:
+    def update_daily_status(self, prices: Dict[str, float]):
+        """일별 자산 상태 업데이트 (일 1회 기록)"""
+        total_value = self.get_total_value(prices, use_entry_price_fallback=True)
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        # 이미 오늘 데이터가 있으면 업데이트
+        for record in self.daily_history:
+            if record['date'] == today:
+                record['total_value'] = total_value
+                return
+
+        # 없으면 추가
+        self.daily_history.append({
+            'date': today,
+            'total_value': total_value
+        })
+
+    def calculate_mdd(self, current_total_value: float = None) -> float:
+        """MDD(Maximum Drawdown) 계산"""
+        values = [d['total_value'] for d in self.daily_history]
+        
+        # 현재 평가금액도 포함하여 계산 (실시간 반영)
+        if current_total_value is not None:
+            values.append(current_total_value)
+            
+        if not values:
+            return 0.0
+            
+        peak = np.maximum.accumulate(values)
+        # 0으로 나누기 방지
+        with np.errstate(divide='ignore', invalid='ignore'):
+            drawdown = (peak - values) / peak
+            drawdown = np.nan_to_num(drawdown) # NaN/Inf 처리
+        return np.max(drawdown) * 100 # % 단위
+
+    def analyze_asset_allocation(self, prices: Dict[str, float]) -> Dict:
+        """자산 배분 현황 분석 (현금 vs 종목별 비중)"""
+        total_value = self.get_total_value(prices, use_entry_price_fallback=True)
+        
+        allocation = {
+            'cash': self.current_capital,
+            'assets': {},
+            'ratios': {
+                'cash': (self.current_capital / total_value * 100) if total_value > 0 else 0.0
+            }
+        }
+        
+        for symbol, quantity in self.positions.items():
+            price = prices.get(symbol, 0)
+            if price <= 0:
+                price = self.entry_prices.get(symbol, 0)
+                
+            val = quantity * price
+            allocation['assets'][symbol] = val
+            allocation['ratios'][symbol] = (val / total_value * 100) if total_value > 0 else 0.0
+            
+        return allocation
+
+    def get_statistics(self, prices: Dict[str, float], use_entry_price_fallback: bool = False) -> Dict:
         """포트폴리오 통계"""
-        total_value = self.get_total_value(prices)
+        total_value = self.get_total_value(prices, use_entry_price_fallback)
+        
+        # [New] 고점 갱신
+        if total_value > self.peak_equity:
+            self.peak_equity = total_value
+            
         total_realized_pnl = sum(
             trade['pnl'] for trade in self.trade_history
         )
+        mdd = self.calculate_mdd(current_total_value=total_value)
         
         return {
             'initial_capital': self.initial_capital,
@@ -211,6 +282,8 @@ class Portfolio:
             'realized_pnl': total_realized_pnl,
             'num_positions': len(self.positions),
             'num_trades': len(self.trade_history),
+            'mdd': mdd,
+            'peak_equity': self.peak_equity,
         }
 
     def get_daily_realized_pnl(self, target_date: datetime = None) -> float:
@@ -243,6 +316,8 @@ class Portfolio:
                 "entry_prices": self.entry_prices,
                 "pyramiding_info": self.pyramiding_info,
                 "metadata": self.metadata,
+                "daily_history": self.daily_history,
+                "peak_equity": self.peak_equity,
                 "trade_history": [
                     {**t, 'timestamp': t['timestamp'].isoformat()} 
                     for t in self.trade_history
@@ -268,6 +343,8 @@ class Portfolio:
                 self.entry_prices = state["entry_prices"]
                 self.pyramiding_info = state.get("pyramiding_info", {})
                 self.metadata = state.get("metadata", {})
+                self.daily_history = state.get("daily_history", [])
+                self.peak_equity = state.get("peak_equity", self.initial_capital)
                 self.trade_history = []
                 for t in state["trade_history"]:
                     t['timestamp'] = datetime.fromisoformat(t['timestamp'])

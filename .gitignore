@@ -7,12 +7,14 @@ __pycache__/
 venv/
 build/
 dist/
+dist_mac/
 *.spec
 .venv/
+*.pkl
 
 # 데이터 및 로그
 logs/
 data/
-models/
 *.log
 *.csv
+models/__init__.py

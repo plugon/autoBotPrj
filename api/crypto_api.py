@@ -4,6 +4,7 @@ import ccxt
 import threading
 import time
 import json
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Optional
 from .base_api import BaseAPI
 from config.settings import MONITORING_CONFIG, TRADING_CONFIG
@@ -81,6 +82,17 @@ class UpbitAPI(BaseAPI):
 
         try:
             import pyupbit
+            
+            # [New] 웹소켓 구독 전 REST API로 현재가 캐시 미리 채우기 (0원 방지)
+            try:
+                tickers = self.exchange.fetch_tickers(symbols)
+                with self.lock:
+                    for symbol, ticker in tickers.items():
+                        if ticker and ticker['last']:
+                            self.price_cache[symbol] = float(ticker['last'])
+                logger.info(f"⚡ [UPBIT] WebSocket 구독 전 초기 시세 캐싱 완료 ({len(tickers)}종목)")
+            except Exception as e:
+                logger.warning(f"⚠️ [UPBIT] 초기 시세 캐싱 실패: {e}")
             
             # 기존 연결 종료
             if self.ws_manager:
@@ -330,6 +342,14 @@ class UpbitAPI(BaseAPI):
         
         # 호가 단위에 맞춰 버림 처리 (매수/매도 공통 안전하게)
         return float(int(price / tick) * tick)
+        # [Fix] 부동소수점 오차 방지를 위해 Decimal 사용
+        try:
+            price_dec = Decimal(str(price))
+            tick_dec = Decimal(str(tick))
+            adjusted_price = (price_dec / tick_dec).to_integral_value(rounding=ROUND_DOWN) * tick_dec
+            return float(adjusted_price)
+        except Exception:
+            return price
 
     def buy(self, symbol: str, quantity: float, price: Optional[float] = None, **kwargs) -> Dict:
         """매수 주문 (재시도 로직 포함)"""
@@ -394,7 +414,22 @@ class UpbitAPI(BaseAPI):
         for attempt in range(3): # 최대 3회 추격
             try:
                 ticker = self.get_ticker(symbol)
-                ask_price = float(ticker['ask'])
+                
+                # [Fix] 호가 정보 유효성 검사 (NoneType Error 방지)
+                if not ticker:
+                    logger.warning(f"⚠️ {symbol} 티커 조회 실패 (Attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+
+                ask_price = ticker.get('ask')
+                if ask_price is None:
+                    ask_price = ticker.get('last') # ask 없으면 현재가로 대체
+                    if ask_price is None:
+                        logger.warning(f"⚠️ {symbol} 가격 정보(ask/last) 없음 (Attempt {attempt+1})")
+                        time.sleep(1)
+                        continue
+                
+                ask_price = float(ask_price)
                 tick_size = self.get_tick_size(ask_price)
                 
                 # 현재가 + N틱 (공격적)
@@ -402,6 +437,7 @@ class UpbitAPI(BaseAPI):
                 target_price = self.adjust_price_unit(target_price)
                 
                 logger.info(f"📉 [SLIPPAGE_PROTECTION] 매수: 현재가({ask_price:,.0f}) 대비 +{slippage_ticks}틱({target_price:,.0f})으로 지정가 제출 ({attempt+1}/3)")
+                logger.info(f"📉 [SLIPPAGE_PROTECTION] 매수: 현재가({ask_price}) 대비 +{slippage_ticks}틱({target_price})으로 지정가 제출 ({attempt+1}/3)")
                 
                 order = self.exchange.create_limit_buy_order(symbol, quantity, target_price)
                 
@@ -523,7 +559,27 @@ class UpbitAPI(BaseAPI):
                 if quantity <= 0: return {}
 
                 ticker = self.get_ticker(symbol)
-                bid_price = float(ticker['bid'])
+                
+                # [Fix] 호가 정보 유효성 검사
+                if not ticker:
+                    logger.warning(f"⚠️ {symbol} 티커 조회 실패 (Attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+
+                bid_price = ticker.get('bid')
+                if bid_price is None:
+                    bid_price = ticker.get('last') # bid 없으면 현재가로 대체
+                    if bid_price is None:
+                        logger.warning(f"⚠️ {symbol} 가격 정보(bid/last) 없음 (Attempt {attempt+1})")
+                        time.sleep(1)
+                        continue
+                
+                if bid_price is None:
+                    logger.warning(f"⚠️ {symbol} 가격 정보(bid/last) 없음 (Attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+
+                bid_price = float(bid_price)
                 tick_size = self.get_tick_size(bid_price)
                 
                 # 현재가 - N틱 (공격적)
@@ -531,6 +587,7 @@ class UpbitAPI(BaseAPI):
                 target_price = self.adjust_price_unit(target_price)
                 
                 logger.info(f"📉 [SLIPPAGE_PROTECTION] 매도: 현재가({bid_price:,.0f}) 대비 -{slippage_ticks}틱({target_price:,.0f})으로 지정가 제출 ({attempt+1}/3)")
+                logger.info(f"📉 [SLIPPAGE_PROTECTION] 매도: 현재가({bid_price}) 대비 -{slippage_ticks}틱({target_price})으로 지정가 제출 ({attempt+1}/3)")
                 
                 order = self.exchange.create_limit_sell_order(symbol, quantity, target_price)
                 
@@ -557,6 +614,7 @@ class UpbitAPI(BaseAPI):
             # 기준가 조회 (슬리피지 계산용)
             ticker = self.get_ticker(symbol)
             ref_price = float(ticker['bid']) if ticker.get('bid') else 0.0
+            ref_price = float(ticker.get('bid') or ticker.get('last') or 0.0)
             
             order = self._sell_market_safe(symbol, quantity)
             if order:
@@ -661,9 +719,10 @@ class UpbitAPI(BaseAPI):
 class BinanceAPI(BaseAPI):
     """바이낸스 API 구현"""
     
-    def __init__(self, api_key: str, api_secret: str):
+    def __init__(self, api_key: str, api_secret: str, account_type: str = 'spot'):
         super().__init__(api_key, api_secret)
         self.exchange = None
+        self.account_type = account_type # 'spot' or 'future'
         # [New] WebSocket 관련
         self.ws_app = None
         self.wst = None
@@ -674,18 +733,22 @@ class BinanceAPI(BaseAPI):
         self.lock = threading.Lock()
         self.callbacks = []
         self.use_websocket = False
-        self.is_future = False
+        self.is_future = (account_type == 'future')
         self.last_ws_update = 0
         self.error_callbacks = []
         self.leverage_cache = {} # [New] 레버리지 캐시
         self.retry_count = 0 # [New] 재연결 시도 횟수
     
+    @property
+    def config(self):
+        """현재 계정 타입에 맞는 설정 반환"""
+        key = "binance_futures" if self.is_future else "binance_spot"
+        return TRADING_CONFIG.get(key, {})
+
     def connect(self):
         """바이낸스 API 연결"""
         try:
-            # [요청사항 1] 현물/선물 분기 (엄격한 적용)
-            self.is_future = TRADING_CONFIG["binance"].get("futures_enabled", False)
-            default_type = 'future' if self.is_future else 'spot'
+            default_type = self.account_type
             
             # [New] API 키 로깅 (보안을 위해 마스킹 처리)
             masked_key = self.api_key[:4] + "*" * 10 + self.api_key[-4:] if self.api_key and len(self.api_key) > 8 else "INVALID"
@@ -771,7 +834,7 @@ class BinanceAPI(BaseAPI):
     def _ensure_market_settings(self, symbol: str):
         """[요청사항 1, 2] 격리 마진 및 레버리지 설정 (하드캡 적용)"""
         # [요청사항 4] 선물 전용 로직 보호 (현물 모드 시 실행 차단)
-        if self.exchange.options.get('defaultType') != 'future':
+        if not self.is_future:
             return
 
         try:
@@ -782,7 +845,7 @@ class BinanceAPI(BaseAPI):
                 pass # 이미 설정된 경우 무시
 
             # 2. 레버리지 설정 및 하드캡 적용
-            config_lev = TRADING_CONFIG["binance"].get("leverage", 1)
+            config_lev = self.config.get("leverage", 1)
             target_lev = config_lev
             
             # [요청사항 2] 5배 초과 시 3배로 강제 하향 조정
@@ -845,6 +908,12 @@ class BinanceAPI(BaseAPI):
         """심볼별 호가 단위(Tick Size) 조회"""
         try:
             market = self.exchange.market(symbol)
+            # [Fix] Binance 정확한 tickSize 조회 (PRICE_FILTER 사용)
+            if 'info' in market and 'filters' in market['info']:
+                for f in market['info']['filters']:
+                    if f['filterType'] == 'PRICE_FILTER':
+                        return float(f['tickSize'])
+            
             # ccxt precisionMode에 따라 다를 수 있으나 binance는 보통 decimal places
             if 'precision' in market and 'price' in market['precision']:
                 precision = market['precision']['price']
@@ -879,7 +948,7 @@ class BinanceAPI(BaseAPI):
         """보유 포지션 조회 (평단가 포함)"""
         try:
             # [요청사항 1] 현물/선물 모드에 따라 조회 방식 분기
-            is_future = self.exchange.options.get('defaultType') == 'future'
+            is_future = self.is_future
             
             if is_future:
                 # [선물] fetch_positions 사용
@@ -898,16 +967,37 @@ class BinanceAPI(BaseAPI):
                 # [현물] fetch_balance 사용 (Spot Balance)
                 balance = self.exchange.fetch_balance()
                 positions = []
-                if 'total' in balance:
-                    for currency, qty in balance['total'].items():
-                        if currency == 'USDT': continue
-                        if qty > 0:
-                            symbol = f"{currency}/USDT"
+                # [Fix] ccxt의 파싱 결과(total)가 아닌, 원본 응답(info)을 사용하여 누락 방지
+                if 'info' in balance and 'balances' in balance['info']:
+                    for asset_balance in balance['info']['balances']:
+                        asset = asset_balance['asset']
+                        free = float(asset_balance['free'])
+                        locked = float(asset_balance['locked'])
+                        total_qty = free + locked
+                        
+                        # USDT와 0 수량은 제외
+                        if asset == 'USDT' or total_qty <= 0:
+                            continue
+                        
+                        symbol = f"{asset}/USDT"
+                        # USDT 페어가 존재하는지 확인 (거래 가능한 자산인지 체크)
+                        if symbol in self.exchange.markets:
                             positions.append({
                                 'symbol': symbol,
-                                'quantity': float(qty),
+                                'quantity': total_qty,
                                 'entry_price': 0.0 # 현물은 평단가 API 미제공
                             })
+                else: # 'info' 필드가 없는 경우 기존 로직으로 fallback
+                    if 'total' in balance:
+                        for currency, qty in balance['total'].items():
+                            if currency == 'USDT': continue
+                            if qty > 0:
+                                symbol = f"{currency}/USDT"
+                                positions.append({
+                                    'symbol': symbol,
+                                    'quantity': float(qty),
+                                    'entry_price': 0.0
+                                })
             return positions
         except Exception as e:
             logger.error(f"포지션 조회 오류: {e}")
@@ -960,8 +1050,8 @@ class BinanceAPI(BaseAPI):
 
     def _buy_aggressive(self, symbol: str, quantity: float) -> Dict:
         """공격적 지정가 매수 (바이낸스용)"""
-        slippage_ticks = TRADING_CONFIG["binance"].get("slippage_ticks", 2)
-        wait_sec = TRADING_CONFIG["binance"].get("order_wait_seconds", 5)
+        slippage_ticks = self.config.get("slippage_ticks", 2)
+        wait_sec = self.config.get("order_wait_seconds", 5)
         
         # 수량 정밀도 보정
         quantity = float(self.exchange.amount_to_precision(symbol, quantity))
@@ -969,7 +1059,22 @@ class BinanceAPI(BaseAPI):
         for attempt in range(3):
             try:
                 ticker = self.get_ticker(symbol)
-                ask_price = float(ticker['ask'])
+                
+                # [Fix] 호가 정보 유효성 검사
+                if not ticker:
+                    logger.warning(f"⚠️ {symbol} 티커 조회 실패 (Attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+
+                ask_price = ticker.get('ask')
+                if ask_price is None:
+                    ask_price = ticker.get('last')
+                    if ask_price is None:
+                        logger.warning(f"⚠️ {symbol} 가격 정보(ask/last) 없음 (Attempt {attempt+1})")
+                        time.sleep(1)
+                        continue
+
+                ask_price = float(ask_price)
                 tick_size = self.get_tick_size(symbol)
                 
                 target_price = ask_price + (tick_size * slippage_ticks)
@@ -988,6 +1093,12 @@ class BinanceAPI(BaseAPI):
                 self.exchange.cancel_order(order['id'], symbol)
                 time.sleep(0.5)
             except Exception as e:
+                error_msg = str(e)
+                # [Fix] 가격 필터 오류 발생 시 시장가로 전환
+                if "PERCENT_PRICE_BY_SIDE" in error_msg:
+                    logger.warning(f"⚠️ [BINANCE] 가격 필터 제한(PERCENT_PRICE_BY_SIDE). 지정가({target_price}) -> 시장가로 전환 시도")
+                    return self.exchange.create_market_buy_order(symbol, quantity)
+                
                 logger.error(f"공격적 매수 오류: {e}")
                 time.sleep(1)
         
@@ -1105,8 +1216,8 @@ class BinanceAPI(BaseAPI):
 
     def _sell_aggressive(self, symbol: str, quantity: float) -> Dict:
         """공격적 지정가 매도 (바이낸스용)"""
-        slippage_ticks = TRADING_CONFIG["binance"].get("slippage_ticks", 2)
-        wait_sec = TRADING_CONFIG["binance"].get("order_wait_seconds", 5)
+        slippage_ticks = self.config.get("slippage_ticks", 2)
+        wait_sec = self.config.get("order_wait_seconds", 5)
         
         quantity = float(self.exchange.amount_to_precision(symbol, quantity))
 
@@ -1120,7 +1231,22 @@ class BinanceAPI(BaseAPI):
                 if quantity <= 0: return {}
 
                 ticker = self.get_ticker(symbol)
-                bid_price = float(ticker['bid'])
+                
+                # [Fix] 호가 정보 유효성 검사
+                if not ticker:
+                    logger.warning(f"⚠️ {symbol} 티커 조회 실패 (Attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+
+                bid_price = ticker.get('bid')
+                if bid_price is None:
+                    bid_price = ticker.get('last')
+                    if bid_price is None:
+                        logger.warning(f"⚠️ {symbol} 가격 정보(bid/last) 없음 (Attempt {attempt+1})")
+                        time.sleep(1)
+                        continue
+
+                bid_price = float(bid_price)
                 tick_size = self.get_tick_size(symbol)
                 
                 target_price = bid_price - (tick_size * slippage_ticks)
@@ -1138,6 +1264,12 @@ class BinanceAPI(BaseAPI):
                 self.exchange.cancel_order(order['id'], symbol)
                 time.sleep(0.5)
             except Exception as e:
+                error_msg = str(e)
+                # [Fix] 가격 필터 오류 발생 시 시장가로 전환
+                if "PERCENT_PRICE_BY_SIDE" in error_msg:
+                    logger.warning(f"⚠️ [BINANCE] 가격 필터 제한(PERCENT_PRICE_BY_SIDE). 지정가({target_price}) -> 시장가로 전환 시도")
+                    return self._sell_market_safe(symbol, quantity)
+
                 logger.error(f"공격적 매도 오류: {e}")
                 time.sleep(1)
         
@@ -1206,6 +1338,17 @@ class BinanceAPI(BaseAPI):
         if not websocket:
             logger.warning("⚠️ websocket-client 미설치로 바이낸스 실시간 시세 불가")
             return
+
+        # [New] 웹소켓 구독 전 REST API로 현재가 캐시 미리 채우기 (0원 방지)
+        try:
+            tickers = self.exchange.fetch_tickers(symbols)
+            with self.lock:
+                for symbol, ticker in tickers.items():
+                    if ticker and ticker['last']:
+                        self.price_cache[symbol] = float(ticker['last'])
+            logger.info(f"⚡ [BINANCE] WebSocket 구독 전 초기 시세 캐싱 완료 ({len(tickers)}종목)")
+        except Exception as e:
+            logger.warning(f"⚠️ [BINANCE] 초기 시세 캐싱 실패: {e}")
 
         self.ws_symbols = [s.replace('/', '').lower() for s in symbols]
         self.symbol_map = {s.replace('/', '').lower(): s for s in symbols}

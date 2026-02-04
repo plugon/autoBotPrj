@@ -30,6 +30,23 @@ def load_data(filepath):
         st.error(f"데이터 로드 오류: {e}")
         return None
 
+def calculate_metrics(history):
+    """거래 기록을 바탕으로 승률과 손익비를 계산"""
+    if not history:
+        return 0.0, 0.0, 0
+    
+    wins = [t['pnl'] for t in history if t['pnl'] > 0]
+    losses = [t['pnl'] for t in history if t['pnl'] <= 0]
+    
+    win_rate = (len(wins) / len(history) * 100)
+    
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf') if gross_profit > 0 else 0.0
+    
+    return win_rate, profit_factor, len(history)
+
 def get_bot_status():
     """봇 상태 파일 읽기"""
     status_file = "data/bot_status.json"
@@ -187,8 +204,55 @@ if st.sidebar.button("🚪 대시보드 종료", use_container_width=True):
     time.sleep(1)
     os._exit(0)
 
+# [New] 전략별 성과 요약 테이블 (상단 배치)
+st.subheader("📊 전략별 성과 요약")
+
+summary_list = []
+portfolio_files = {
+    "🚀 Crypto (Upbit)": "data/crypto_portfolio.json",
+    "🇰🇷 Stock (Korea)": "data/stock_portfolio.json",
+    "🟡 Binance Spot": "data/binance_spot_portfolio.json",
+    "🔴 Binance Futures": "data/binance_futures_portfolio.json"
+}
+
+for name, filepath in portfolio_files.items():
+    p_data = load_data(filepath)
+    if p_data:
+        initial = p_data.get("initial_capital", 0)
+        current_cash = p_data.get("current_capital", 0)
+        positions = p_data.get("positions", {})
+        entry_prices = p_data.get("entry_prices", {})
+        
+        # 추정 자산 (현재가 정보가 없으므로 평단가 기준)
+        holdings_val = sum(positions[sym] * entry_prices.get(sym, 0) for sym in positions)
+        total_est = current_cash + holdings_val
+        
+        # 누적 손익
+        total_pnl = total_est - initial
+        pnl_pct = (total_pnl / initial * 100) if initial > 0 else 0.0
+        
+        # 승률/손익비
+        history = p_data.get("trade_history", [])
+        win_rate, pf, trade_cnt = calculate_metrics(history)
+        
+        summary_list.append({
+            "전략": name,
+            "총 자산 (추정)": f"{total_est:,.0f}",
+            "누적 손익": f"{total_pnl:,.0f} ({pnl_pct:+.1f}%)",
+            "승률": f"{win_rate:.1f}%",
+            "손익비": f"{pf:.2f}",
+            "거래 횟수": f"{trade_cnt}회"
+        })
+
+if summary_list:
+    st.dataframe(pd.DataFrame(summary_list), use_container_width=True, hide_index=True)
+else:
+    st.info("데이터가 없습니다.")
+
+st.divider()
+
 # 탭 생성
-tab1, tab2 = st.tabs(["🚀 암호화폐 (Crypto)", "🇰🇷 국내주식 (Stock)"])
+tab1, tab2, tab3, tab4 = st.tabs(["🚀 업비트 (Upbit)", "🇰🇷 국내주식 (Stock)", "🟡 바이낸스 현물", "🔴 바이낸스 선물"])
 
 def display_portfolio(data, title, is_crypto=False):
     if not data:
@@ -313,6 +377,47 @@ def display_portfolio(data, title, is_crypto=False):
             
         except Exception as e:
             st.error(f"상세 분석 중 오류: {e}")
+
+    st.divider()
+
+    # [추가] 3-2. 일별 자산 변동 및 MDD 차트
+    daily_history = data.get("daily_history", [])
+    if daily_history:
+        st.subheader("📅 일별 자산 변동 및 MDD")
+        
+        try:
+            df_daily = pd.DataFrame(daily_history)
+            df_daily['date'] = pd.to_datetime(df_daily['date'])
+            df_daily = df_daily.sort_values('date')
+            df_daily.set_index('date', inplace=True)
+            
+            # 일별 수익률 계산
+            df_daily['daily_return'] = df_daily['total_value'].pct_change() * 100
+            df_daily['daily_return'] = df_daily['daily_return'].fillna(0)
+            
+            # MDD 계산 (Drawdown Series)
+            df_daily['peak'] = df_daily['total_value'].cummax()
+            df_daily['drawdown'] = (df_daily['total_value'] - df_daily['peak']) / df_daily['peak'] * 100
+            
+            # 차트 1: 자산 추이 & MDD (영역 차트)
+            st.markdown("**📉 자산 추이 및 Drawdown**")
+            
+            col_d1, col_d2 = st.columns(2)
+            
+            with col_d1:
+                st.caption("자산 가치 (Total Value)")
+                st.line_chart(df_daily['total_value'])
+                
+            with col_d2:
+                st.caption("Drawdown (%)")
+                st.area_chart(df_daily['drawdown'], color="#ff4b4b")
+
+            # 차트 2: 일별 수익률 (Bar Chart)
+            st.markdown("**📊 일별 수익률 (Daily Return %)**")
+            st.bar_chart(df_daily['daily_return'])
+            
+        except Exception as e:
+            st.error(f"일별 데이터 시각화 오류: {e}")
 
     st.divider()
 
@@ -487,6 +592,14 @@ with tab1:
 with tab2:
     data = load_data("data/stock_portfolio.json")
     display_portfolio(data, "국내주식", is_crypto=False)
+
+with tab3:
+    data = load_data("data/binance_spot_portfolio.json")
+    display_portfolio(data, "바이낸스 현물", is_crypto=True)
+
+with tab4:
+    data = load_data("data/binance_futures_portfolio.json")
+    display_portfolio(data, "바이낸스 선물", is_crypto=True)
 
 # 로그 표시 (전체 탭 공통 하단)
 display_logs()

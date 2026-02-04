@@ -66,8 +66,11 @@ UPBIT_API_SECRET = os.getenv("UPBIT_API_SECRET", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "your_binance_api_key")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "your_binance_api_secret")
 
-BINANCE_SYMBOLS_STR = os.getenv("BINANCE_SYMBOLS", "BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT")
-BINANCE_SYMBOLS = [s.strip() for s in BINANCE_SYMBOLS_STR.split(",")]
+BINANCE_SPOT_SYMBOLS_STR = os.getenv("BINANCE_SPOT_SYMBOLS", "BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT")
+BINANCE_SPOT_SYMBOLS = [s.strip() for s in BINANCE_SPOT_SYMBOLS_STR.split(",")]
+
+BINANCE_FUTURES_SYMBOLS_STR = os.getenv("BINANCE_FUTURES_SYMBOLS", "BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT")
+BINANCE_FUTURES_SYMBOLS = [s.strip() for s in BINANCE_FUTURES_SYMBOLS_STR.split(",")]
 
 # 텔레그램 설정
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -157,19 +160,40 @@ TRADING_CONFIG = {
     },
     
     # ─────────────────────────────────────────────────────────────────────────
-    # 바이낸스 거래 설정 (USDT 마켓)
+    # 바이낸스 현물 (Spot) 설정
     # ─────────────────────────────────────────────────────────────────────────
-    "binance": {
-        "symbols": BINANCE_SYMBOLS,
-        "initial_capital": get_env_float("BINANCE_INITIAL_CAPITAL", 1000), # USDT 기준
-        "max_position_size": get_env_float("BINANCE_MAX_POSITION_SIZE", 0.3),
-        "leverage": get_env_int("BINANCE_LEVERAGE", 1), # [New] 레버리지 설정 (기본 1배)
-        "futures_enabled": get_env_bool("BINANCE_FUTURES_ENABLED", False), # [New] 선물 모드 활성화
-        "take_profit_percent": get_env_float("BINANCE_TAKE_PROFIT", 0.10),
-        "trailing_stop_percent": get_env_float("BINANCE_TRAILING_STOP", 0.02),
+    "binance_spot": {
+        "symbols": BINANCE_SPOT_SYMBOLS,
+        "initial_capital": get_env_float("BINANCE_SPOT_INITIAL_CAPITAL", 1000),
+        "max_position_size": get_env_float("BINANCE_SPOT_MAX_POSITION_SIZE", 0.3),
+        "take_profit_percent": get_env_float("BINANCE_SPOT_TAKE_PROFIT", 0.10),
+        "trailing_stop_percent": get_env_float("BINANCE_SPOT_TRAILING_STOP", 0.02),
         "timeframe": "15m",
-        "max_positions": get_env_int("BINANCE_MAX_POSITIONS", 3),
-        "min_order_amount": get_env_float("BINANCE_MIN_ORDER_AMOUNT", 10), # 최소 10 USDT
+        "max_positions": get_env_int("BINANCE_SPOT_MAX_POSITIONS", 3),
+        "min_order_amount": get_env_float("BINANCE_SPOT_MIN_ORDER_AMOUNT", 10),
+        "cancel_timeout": 300,
+        "slippage_ticks": 2,
+        "order_wait_seconds": 5,
+        "atr_window": 20,
+        "atr_multiplier": 2.0,
+        "stop_loss_percent": 0.0,
+        "entry_strategy": "breakout",
+        "pyramiding_enabled": True,
+    },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 바이낸스 선물 (Futures) 설정
+    # ─────────────────────────────────────────────────────────────────────────
+    "binance_futures": {
+        "symbols": BINANCE_FUTURES_SYMBOLS,
+        "initial_capital": get_env_float("BINANCE_FUTURES_INITIAL_CAPITAL", 1000),
+        "max_position_size": get_env_float("BINANCE_FUTURES_MAX_POSITION_SIZE", 0.3),
+        "leverage": get_env_int("BINANCE_FUTURES_LEVERAGE", 1),
+        "take_profit_percent": get_env_float("BINANCE_FUTURES_TAKE_PROFIT", 0.10),
+        "trailing_stop_percent": get_env_float("BINANCE_FUTURES_TRAILING_STOP", 0.02),
+        "timeframe": "15m",
+        "max_positions": get_env_int("BINANCE_FUTURES_MAX_POSITIONS", 3),
+        "min_order_amount": get_env_float("BINANCE_FUTURES_MIN_ORDER_AMOUNT", 10),
         "cancel_timeout": 300,
         "slippage_ticks": 2,
         "order_wait_seconds": 5,
@@ -261,5 +285,6 @@ API_CONFIG = {
     "kiwoom": get_env_bool("ENABLE_KIWOOM", False),     # 키움증권
     "daishin": get_env_bool("ENABLE_DAISHIN", False),   # 대신증권
     "upbit": get_env_bool("ENABLE_UPBIT", False),        # 업비트 암호화폐 거래소
-    "binance": get_env_bool("ENABLE_BINANCE", False),   # 바이낸스 암호화폐 거래소
+    "binance_spot": get_env_bool("ENABLE_BINANCE_SPOT", False),     # 바이낸스 현물
+    "binance_futures": get_env_bool("ENABLE_BINANCE_FUTURES", False), # 바이낸스 선물
 }
