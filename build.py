@@ -78,9 +78,19 @@ def build_exe():
     print("\n📊 3/3: Analyze Performance 빌드 시작")
     PyInstaller.__main__.run(['analyze_performance.py', '--name=AnalyzePerformance', '--onefile', '--clean'] + icon_args)
 
+    # 4. Backtester 빌드 (추가)
+    print("\n🧪 4/4: Backtester 빌드 시작")
+    backtest_args = ['run_backtest_all.py', '--name=Backtester', '--onefile', '--clean'] + icon_args
+    for hi in ['tensorflow', 'onnxruntime', 'tf2onnx', 'sklearn.utils._typedefs', 'websocket']:
+        backtest_args.append(f'--hidden-import={hi}')
+    # 텐서플로우 데이터 추가 (필요 시)
+    for src, dest in tf_datas: backtest_args.append(f'--add-data={src}{os.pathsep}{dest}')
+    PyInstaller.__main__.run(backtest_args)
+
     # 마무리 작업
     for folder in ['data', 'logs', 'models', 'config']: os.makedirs(os.path.join("dist", folder), exist_ok=True)
     if os.path.exists(".env"): shutil.copy(".env", "dist/.env")
+    if os.path.exists(".env_secret"): shutil.copy(".env_secret", "dist/.env_secret") # [New] 시크릿 파일 복사
     print("\n✅ 빌드 완료! dist 폴더를 확인하세요.")
 
 if __name__ == "__main__":

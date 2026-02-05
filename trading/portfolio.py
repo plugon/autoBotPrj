@@ -19,12 +19,13 @@ class Portfolio:
         self.positions: Dict[str, float] = {}  # {symbol: quantity}
         self.entry_prices: Dict[str, float] = {}  # {symbol: entry_price}
         self.trade_history: List[Dict] = []
+        self.atr_values: Dict[str, float] = {} # [New] 진입 시점 ATR 저장 {symbol: atr}
         self.pyramiding_info: Dict[str, Dict] = {} # {symbol: {'count': 0, 'last_entry_price': 0.0}}
         self.metadata: Dict = {}  # 전략 정보 등 메타데이터 저장
         self.daily_history: List[Dict] = [] # [{'date': 'YYYY-MM-DD', 'total_value': float}]
         self.peak_equity = initial_capital # [New] 실시간 고점 추적용
     
-    def add_position(self, symbol: str, quantity: float, entry_price: float, fee_rate: float = 0.0) -> bool:
+    def add_position(self, symbol: str, quantity: float, entry_price: float, fee_rate: float = 0.0, atr_value: float = 0.0, reason: str = "") -> bool:
         """포지션 추가"""
         try:
             cost = quantity * entry_price
@@ -43,6 +44,8 @@ class Portfolio:
             if symbol not in self.positions:
                 self.positions[symbol] = quantity
                 self.entry_prices[symbol] = entry_price
+                if atr_value > 0:
+                    self.atr_values[symbol] = atr_value
             else:
                 # 기존 포지션에 추가
                 total_quantity = self.positions[symbol] + quantity
@@ -52,12 +55,15 @@ class Portfolio:
                 )
                 self.positions[symbol] = total_quantity
                 self.entry_prices[symbol] = avg_price
+                # [New] 추가 매수 시 ATR 업데이트 (최신 값 반영)
+                if atr_value > 0:
+                    self.atr_values[symbol] = atr_value
             
             # 자본 차감
             self.current_capital -= total_cost
             
             logger.info(
-                f"포지션 추가: {symbol} {quantity}주 @ {entry_price}"
+                f"포지션 추가: {symbol} {quantity}주 @ {entry_price} (사유: {reason})"
             )
             return True
         
@@ -65,10 +71,12 @@ class Portfolio:
             logger.error(f"포지션 추가 오류: {e}")
             return False
     
-    def sync_position(self, symbol: str, quantity: float, entry_price: float):
+    def sync_position(self, symbol: str, quantity: float, entry_price: float, atr_value: float = 0.0):
         """외부 포지션 동기화 (자본 차감 없이 포지션만 등록)"""
         self.positions[symbol] = quantity
         self.entry_prices[symbol] = entry_price
+        if atr_value > 0:
+            self.atr_values[symbol] = atr_value
         # 동기화 시 피라미딩 정보가 없으면 초기화
         if symbol not in self.pyramiding_info:
             self.pyramiding_info[symbol] = {'count': 0, 'last_entry_price': entry_price}
@@ -87,11 +95,13 @@ class Portfolio:
             del self.positions[symbol]
         if symbol in self.entry_prices:
             del self.entry_prices[symbol]
+        if symbol in self.atr_values:
+            del self.atr_values[symbol]
         if symbol in self.pyramiding_info:
             del self.pyramiding_info[symbol]
 
     def close_position(self, symbol: str, quantity: float, 
-                      exit_price: float, fee_rate: float = 0.0) -> bool:
+                      exit_price: float, fee_rate: float = 0.0, reason: str = "") -> bool:
         """포지션 종료"""
         try:
             if symbol not in self.positions or self.positions[symbol] < quantity:
@@ -113,6 +123,8 @@ class Portfolio:
             if self.positions[symbol] == 0:
                 del self.positions[symbol]
                 del self.entry_prices[symbol]
+                if symbol in self.atr_values:
+                    del self.atr_values[symbol]
                 if symbol in self.pyramiding_info:
                     del self.pyramiding_info[symbol]
             
@@ -128,12 +140,13 @@ class Portfolio:
                 'entry_price': entry_price_val,
                 'exit_price': exit_price,
                 'pnl': pnl,
-                'pnl_percent': pnl_percent
+                'pnl_percent': pnl_percent,
+                'reason': reason # [New] 사유 저장
             })
             
             logger.info(
                 f"포지션 종료: {symbol} {quantity}주 @ {exit_price} "
-                f"PnL: {pnl:.2f} ({pnl_percent:.2f}%)"
+                f"PnL: {pnl:.2f} ({pnl_percent:.2f}%) | 사유: {reason}"
             )
             return True
         
@@ -314,6 +327,7 @@ class Portfolio:
                 "current_capital": self.current_capital,
                 "positions": self.positions,
                 "entry_prices": self.entry_prices,
+                "atr_values": self.atr_values, # [New] 저장
                 "pyramiding_info": self.pyramiding_info,
                 "metadata": self.metadata,
                 "daily_history": self.daily_history,
@@ -341,6 +355,7 @@ class Portfolio:
                 self.current_capital = state["current_capital"]
                 self.positions = state["positions"]
                 self.entry_prices = state["entry_prices"]
+                self.atr_values = state.get("atr_values", {}) # [New] 로드
                 self.pyramiding_info = state.get("pyramiding_info", {})
                 self.metadata = state.get("metadata", {})
                 self.daily_history = state.get("daily_history", [])

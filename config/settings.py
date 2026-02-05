@@ -10,6 +10,11 @@ else:
     # 스크립트로 실행될 때: 프로젝트 루트 기준 (config 폴더의 상위)
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# [New] .env_secret 로드 (API 키 등 민감 정보) - 우선 로드
+SECRET_ENV_PATH = os.path.join(BASE_DIR, '.env_secret')
+if os.path.exists(SECRET_ENV_PATH):
+    load_dotenv(SECRET_ENV_PATH)
+
 ENV_PATH = os.path.join(BASE_DIR, '.env')
 load_dotenv(ENV_PATH)
 
@@ -72,6 +77,9 @@ BINANCE_SPOT_SYMBOLS = [s.strip() for s in BINANCE_SPOT_SYMBOLS_STR.split(",")]
 BINANCE_FUTURES_SYMBOLS_STR = os.getenv("BINANCE_FUTURES_SYMBOLS", "BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT")
 BINANCE_FUTURES_SYMBOLS = [s.strip() for s in BINANCE_FUTURES_SYMBOLS_STR.split(",")]
 
+UPBIT_SYMBOLS_STR = os.getenv("UPBIT_SYMBOLS", "SOL/KRW,XRP/KRW,DOGE/KRW,AVAX/KRW")
+UPBIT_SYMBOLS = [s.strip() for s in UPBIT_SYMBOLS_STR.split(",")]
+
 # 텔레그램 설정
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -107,6 +115,11 @@ STRATEGY_PRESETS = {
         "take_profit_percent": 0.50,    # 50% 목표
         "trailing_stop_percent": 0.10,
         "timeframe": "1d",
+    },
+    "agile": { # [New] 기민한 스캘핑 (Agile Strategy 전용)
+        "take_profit_percent": 0.02,    # 2% 목표 (빠른 회전)
+        "trailing_stop_percent": 0.005, # 0.5% (매우 타이트한 트레일링 스탑)
+        "timeframe": "1m",              # 1분봉 기본
     }
 }
 
@@ -115,6 +128,49 @@ STRATEGY_PRESETS = {
 # 설정 방법: .env 파일에 CRYPTO_STRATEGY_PRESET=mid_term 와 같이 입력
 selected_strategy_name = os.getenv("CRYPTO_STRATEGY_PRESET", "scalping").lower()
 selected_strategy = STRATEGY_PRESETS.get(selected_strategy_name, STRATEGY_PRESETS["scalping"])
+
+# [New] 바이낸스 전용 전략 프리셋 정의 (레버리지 포함)
+BINANCE_STRATEGY_PRESETS = {
+    "scalping": { # 초단타 (1분봉)
+        "take_profit_percent": 0.015,   # 1.5% (수수료가 낮아 타이트하게)
+        "trailing_stop_percent": 0.008, # 0.8%
+        "timeframe": "1m",
+        "leverage": 5,
+    },
+    "short_term": { # 단기 (15분봉)
+        "take_profit_percent": 0.05,    # 5.0%
+        "trailing_stop_percent": 0.012, # 1.2%
+        "timeframe": "15m",
+        "leverage": 3,
+    },
+    "mid_term": { # 중기 (4시간봉)
+        "take_profit_percent": 0.15,    # 15%
+        "trailing_stop_percent": 0.03,  # 3.0%
+        "timeframe": "4h",
+        "leverage": 2,
+    },
+    "long_term": { # 장기 (일봉)
+        "take_profit_percent": 0.40,    # 40%
+        "trailing_stop_percent": 0.08,  # 8.0%
+        "timeframe": "1d",
+        "leverage": 1,
+    },
+    "agile": { # 기민한 스캘핑
+        "take_profit_percent": 0.015,
+        "trailing_stop_percent": 0.004,
+        "timeframe": "1m",
+        "leverage": 5,
+    }
+}
+
+# [Fix] 바이낸스 현물/선물 전략 분리 (기본값은 BINANCE_STRATEGY_PRESET 공유)
+default_binance_strategy = os.getenv("BINANCE_STRATEGY_PRESET", "short_term").lower()
+
+spot_strategy_name = os.getenv("BINANCE_SPOT_STRATEGY_PRESET", default_binance_strategy).lower()
+selected_spot_strategy = BINANCE_STRATEGY_PRESETS.get(spot_strategy_name, BINANCE_STRATEGY_PRESETS["short_term"])
+
+futures_strategy_name = os.getenv("BINANCE_FUTURES_STRATEGY_PRESET", default_binance_strategy).lower()
+selected_futures_strategy = BINANCE_STRATEGY_PRESETS.get(futures_strategy_name, BINANCE_STRATEGY_PRESETS["short_term"])
 
 
 TRADING_CONFIG = {
@@ -134,18 +190,18 @@ TRADING_CONFIG = {
     # 암호화폐 거래 설정 (현재 활성화됨)
     # ─────────────────────────────────────────────────────────────────────────
     "crypto": {
-        "symbols": ["SOL/KRW", "XRP/KRW", "DOGE/KRW", "AVAX/KRW"],  # [변경] 알트코인 위주 구성
+        "symbols": UPBIT_SYMBOLS,  # [변경] .env 또는 상단 변수에서 설정
         "initial_capital": get_env_float("CRYPTO_INITIAL_CAPITAL", 300000), # 봇 운용 초기 자본금 (KRW)
         "max_position_size": get_env_float("CRYPTO_MAX_POSITION_SIZE", 0.2), # 종목당 최대 투자 비중 (0.2 = 20%)
         # 전략 프리셋 또는 .env 개별 설정으로 값 결정
         "take_profit_percent": get_env_float("TAKE_PROFIT_PCT", get_env_float("CRYPTO_TAKE_PROFIT", selected_strategy["take_profit_percent"])),
-        "trailing_stop_percent": get_env_float("CRYPTO_TRAILING_STOP", 0.015), # 기본값 1.5%
+        "trailing_stop_percent": get_env_float("CRYPTO_TRAILING_STOP", selected_strategy.get("trailing_stop_percent", 0.015)), # 프리셋 값 적용
         "timeframe": os.getenv("CRYPTO_TIMEFRAME", selected_strategy["timeframe"]),
         "max_positions": get_env_int("CRYPTO_MAX_POSITIONS", 5),      # 최대 보유 종목 수 (기본값 5개)
         "min_order_amount": get_env_float("CRYPTO_MIN_ORDER_AMOUNT", 5000), # 최소 주문 금액 (기본값 5000원)
         "cancel_timeout": get_env_int("CRYPTO_CANCEL_TIMEOUT", 300),  # 미체결 주문 자동 취소 대기 시간 (초)
         "slippage_ticks": get_env_int("CRYPTO_SLIPPAGE_TICKS", 2),    # [New] 공격적 지정가 슬리피지 허용 틱 (기본 2틱)
-        "order_wait_seconds": get_env_int("CRYPTO_ORDER_WAIT_SECONDS", 5), # [New] 주문 체결 대기 시간 (초)
+        "order_wait_seconds": get_env_int("CRYPTO_ORDER_WAIT_SECONDS", 3), # [New] 주문 체결 대기 시간 (초)
         "atr_window": get_env_int("CRYPTO_ATR_WINDOW", 20), # ATR(변동성) 지표 계산 기간
         "atr_multiplier": get_env_float("CRYPTO_ATR_MULTIPLIER", 2.0), # 손절 범위 계수 (ATR * n). 클수록 손절 라인이 여유로워짐 (권장 1.5~3.0)
         "adx_threshold": get_env_float("CRYPTO_ADX_THRESHOLD", 15.0),  # 추세 강도 필터 (높을수록 강한 추세에서만 진입)
@@ -166,18 +222,18 @@ TRADING_CONFIG = {
         "symbols": BINANCE_SPOT_SYMBOLS,
         "initial_capital": get_env_float("BINANCE_SPOT_INITIAL_CAPITAL", 1000),
         "max_position_size": get_env_float("BINANCE_SPOT_MAX_POSITION_SIZE", 0.3),
-        "take_profit_percent": get_env_float("BINANCE_SPOT_TAKE_PROFIT", 0.10),
-        "trailing_stop_percent": get_env_float("BINANCE_SPOT_TRAILING_STOP", 0.02),
-        "timeframe": "15m",
+        "take_profit_percent": get_env_float("BINANCE_SPOT_TAKE_PROFIT", selected_spot_strategy["take_profit_percent"]),
+        "trailing_stop_percent": get_env_float("BINANCE_SPOT_TRAILING_STOP", selected_spot_strategy["trailing_stop_percent"]),
+        "timeframe": os.getenv("BINANCE_SPOT_TIMEFRAME", selected_spot_strategy["timeframe"]),
         "max_positions": get_env_int("BINANCE_SPOT_MAX_POSITIONS", 3),
         "min_order_amount": get_env_float("BINANCE_SPOT_MIN_ORDER_AMOUNT", 10),
         "cancel_timeout": 300,
         "slippage_ticks": 2,
-        "order_wait_seconds": 5,
+        "order_wait_seconds": 3,
         "atr_window": 20,
         "atr_multiplier": 2.0,
-        "stop_loss_percent": 0.0,
-        "entry_strategy": "breakout",
+        "stop_loss_percent": get_env_float("BINANCE_SPOT_STOP_LOSS", 0.0),
+        "entry_strategy": os.getenv("BINANCE_SPOT_ENTRY_STRATEGY", "breakout"),
         "pyramiding_enabled": True,
     },
 
@@ -188,19 +244,19 @@ TRADING_CONFIG = {
         "symbols": BINANCE_FUTURES_SYMBOLS,
         "initial_capital": get_env_float("BINANCE_FUTURES_INITIAL_CAPITAL", 1000),
         "max_position_size": get_env_float("BINANCE_FUTURES_MAX_POSITION_SIZE", 0.3),
-        "leverage": get_env_int("BINANCE_FUTURES_LEVERAGE", 1),
-        "take_profit_percent": get_env_float("BINANCE_FUTURES_TAKE_PROFIT", 0.10),
-        "trailing_stop_percent": get_env_float("BINANCE_FUTURES_TRAILING_STOP", 0.02),
-        "timeframe": "15m",
+        "leverage": get_env_int("BINANCE_FUTURES_LEVERAGE", selected_futures_strategy["leverage"]),
+        "take_profit_percent": get_env_float("BINANCE_FUTURES_TAKE_PROFIT", selected_futures_strategy["take_profit_percent"]),
+        "trailing_stop_percent": get_env_float("BINANCE_FUTURES_TRAILING_STOP", selected_futures_strategy["trailing_stop_percent"]),
+        "timeframe": os.getenv("BINANCE_FUTURES_TIMEFRAME", selected_futures_strategy["timeframe"]),
         "max_positions": get_env_int("BINANCE_FUTURES_MAX_POSITIONS", 3),
         "min_order_amount": get_env_float("BINANCE_FUTURES_MIN_ORDER_AMOUNT", 10),
         "cancel_timeout": 300,
         "slippage_ticks": 2,
-        "order_wait_seconds": 5,
+        "order_wait_seconds": 3,
         "atr_window": 20,
         "atr_multiplier": 2.0,
-        "stop_loss_percent": 0.0,
-        "entry_strategy": "breakout",
+        "stop_loss_percent": get_env_float("BINANCE_FUTURES_STOP_LOSS", 0.0),
+        "entry_strategy": os.getenv("BINANCE_FUTURES_ENTRY_STRATEGY", "breakout"),
         "pyramiding_enabled": True,
     }
 }
@@ -228,6 +284,7 @@ ML_CONFIG = {
     "train_ratio": 0.8,                 # 학습 데이터 80%
     "validation_ratio": 0.1,            # 검증 데이터 10%
     "test_ratio": 0.1,                  # 테스트 데이터 10%
+    "models_dir": os.getenv("MODELS_DIR", "models"), # [New] 모델 저장 폴더명
 }
 
 """
@@ -250,7 +307,7 @@ MONITORING_CONFIG = {
 """
 
 VOLUME_CONFIG = {
-    "auto_select_enabled": True,        # 거래량 기반 자동 종목 선택 활성화
+    "auto_select_enabled": get_env_bool("AUTO_SELECT_SYMBOLS", True),        # 거래량 기반 자동 종목 선택 활성화
     "min_volume_krw": 100000000,        # 최소 거래량: 1억원 이상만 선택
     "max_symbols": get_env_int("MAX_SYMBOLS", 10), # 최대 감시 종목 수 (기본값 10개)
     "update_interval": 3600,            # 1시간마다 종목 목록 업데이트 (초 단위)

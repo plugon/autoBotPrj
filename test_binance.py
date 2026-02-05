@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
+load_dotenv(".env_secret") # [New] 시크릿 파일 로드 추가
 
 def test_connection():
     api_key = os.getenv("BINANCE_API_KEY")

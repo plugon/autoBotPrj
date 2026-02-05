@@ -360,6 +360,16 @@ class UpbitAPI(BaseAPI):
         if price:
             # [요청사항 1] 호가 단위 보정
             price = self.adjust_price_unit(price)
+        
+        # [Fix] 수량 정밀도 보정 (업비트 규격 준수)
+        quantity = float(self.exchange.amount_to_precision(symbol, quantity))
+
+        # [New] 최소 주문 금액 체크 (5,000원) - 업비트 KRW 마켓 제한
+        if price and "KRW" in symbol:
+            total_value = price * quantity
+            if total_value < 5000:
+                logger.warning(f"⚠️ [UPBIT] 주문 금액({total_value:,.0f}원)이 최소 주문 금액(5,000원) 미만입니다. 매수 취소.")
+                return {}
 
         max_retries = 2
         for attempt in range(max_retries + 1):
@@ -411,6 +421,9 @@ class UpbitAPI(BaseAPI):
         slippage_ticks = TRADING_CONFIG["crypto"].get("slippage_ticks", 2)
         wait_sec = TRADING_CONFIG["crypto"].get("order_wait_seconds", 5)
         
+        # [Fix] 수량 정밀도 보정
+        quantity = float(self.exchange.amount_to_precision(symbol, quantity))
+        
         for attempt in range(3): # 최대 3회 추격
             try:
                 ticker = self.get_ticker(symbol)
@@ -436,6 +449,13 @@ class UpbitAPI(BaseAPI):
                 target_price = ask_price + (tick_size * slippage_ticks)
                 target_price = self.adjust_price_unit(target_price)
                 
+                # [New] 최소 주문 금액 체크 (5,000원)
+                if "KRW" in symbol:
+                    total_value = target_price * quantity
+                    if total_value < 5000:
+                        logger.warning(f"⚠️ [UPBIT] 주문 금액({total_value:,.0f}원)이 최소 주문 금액(5,000원) 미만입니다. 매수 취소.")
+                        return {}
+
                 logger.info(f"📉 [SLIPPAGE_PROTECTION] 매수: 현재가({ask_price:,.0f}) 대비 +{slippage_ticks}틱({target_price:,.0f})으로 지정가 제출 ({attempt+1}/3)")
                 logger.info(f"📉 [SLIPPAGE_PROTECTION] 매수: 현재가({ask_price}) 대비 +{slippage_ticks}틱({target_price})으로 지정가 제출 ({attempt+1}/3)")
                 
@@ -557,6 +577,9 @@ class UpbitAPI(BaseAPI):
                 if available < quantity:
                     quantity = available
                 if quantity <= 0: return {}
+                
+                # [Fix] 수량 정밀도 보정 (업비트 규격 준수)
+                quantity = float(self.exchange.amount_to_precision(symbol, quantity))
 
                 ticker = self.get_ticker(symbol)
                 
@@ -636,6 +659,9 @@ class UpbitAPI(BaseAPI):
             available = float(balance.get(currency, {}).get('free', 0))
             if available < quantity:
                 quantity = available
+            
+            # [Fix] 수량 정밀도 보정
+            quantity = float(self.exchange.amount_to_precision(symbol, quantity))
             
             if quantity > 0:
                 return self.exchange.create_market_sell_order(symbol, quantity)
@@ -738,6 +764,7 @@ class BinanceAPI(BaseAPI):
         self.error_callbacks = []
         self.leverage_cache = {} # [New] 레버리지 캐시
         self.retry_count = 0 # [New] 재연결 시도 횟수
+        self.last_dust_conversion = 0 # [New] Dust 변환 쿨타임
     
     @property
     def config(self):
@@ -830,6 +857,59 @@ class BinanceAPI(BaseAPI):
         except Exception as e:
             logger.error(f"{symbol} 청산 리스크 조회 오류: {e}")
         return {}
+
+    def convert_dust_to_bnb(self, assets: List[str] = None) -> Dict:
+        """소액 잔고(Dust)를 BNB로 변환 (Binance Spot Only)"""
+        if self.is_future:
+            return {}
+
+        # [New] 쿨타임 체크 (1시간 + 여유분)
+        if time.time() - self.last_dust_conversion < 3660:
+            return {}
+
+        try:
+            # 변환할 자산 목록이 없으면 조회하여 전체 변환 시도
+            if not assets:
+                try:
+                    # 변환 가능 자산 조회 (POST /sapi/v1/asset/dust-btc)
+                    response = self.exchange.sapi_post_asset_dust_btc()
+                    details = response.get('details', [])
+                    if not details:
+                        logger.info("ℹ️ [BINANCE] 변환 가능한 소액 잔고(Dust)가 없습니다.")
+                        return {}
+                    assets = [item['asset'] for item in details]
+                except Exception as e:
+                    logger.warning(f"Dust 조회 실패: {e}")
+                    return {}
+
+            # [Fix] BNB 코인은 변환 대상에서 제외 (Self-conversion 방지)
+            if assets:
+                assets = [a for a in assets if a != "BNB"]
+
+            if not assets:
+                return {}
+
+            logger.info(f"🧹 [BINANCE] Dust BNB 변환 시도: {assets}")
+            # 변환 실행 (POST /sapi/v1/asset/dust)
+            result = self.exchange.sapi_post_asset_dust({'asset': assets})
+            
+            # 성공 시 쿨타임 갱신
+            self.last_dust_conversion = time.time()
+            
+            # 결과 로깅
+            total_transfer = result.get('totalTransfered', 0)
+            logger.info(f"✅ [BINANCE] Dust 변환 성공 (총 {total_transfer} BNB)")
+            return result
+
+        except Exception as e:
+            logger.error(f"Dust 변환 오류: {e}")
+            error_msg = str(e)
+            if "32110" in error_msg or "once within" in error_msg:
+                logger.warning(f"⚠️ [BINANCE] Dust 변환 쿨타임 제한: {error_msg}")
+                self.last_dust_conversion = time.time()
+            else:
+                logger.error(f"Dust 변환 오류: {e}")
+            return {}
 
     def _ensure_market_settings(self, symbol: str):
         """[요청사항 1, 2] 격리 마진 및 레버리지 설정 (하드캡 적용)"""
@@ -930,9 +1010,12 @@ class BinanceAPI(BaseAPI):
         except:
             return price
 
-    def get_ohlcv(self, symbol: str, timeframe: str = "1d", limit: int = 200) -> pd.DataFrame:
+    def get_ohlcv(self, symbol: str, timeframe: str = "1d", limit: int = 200, count: int = None, min_required_data: int = 200) -> pd.DataFrame:
         """OHLCV 데이터 조회"""
         try:
+            if count is not None:
+                limit = count
+
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(
                 ohlcv,
@@ -1120,19 +1203,32 @@ class BinanceAPI(BaseAPI):
             # 2. 가격 계산
             # 익절가 (Limit Maker)
             tp_price = buy_price * (1 + take_profit_pct)
-            
             # 손절 트리거 (Stop Price)
             sl_trigger = buy_price * (1 - stop_loss_pct)
             
+            # [Fix] 현재가 기준 유효성 검증 및 보정 (가격 급변 대응)
+            current_price = self.get_price(symbol)
+            if current_price > 0:
+                # 손절가가 현재가보다 높거나 같으면 실패함 -> 현재가보다 0.5% 아래로 강제 조정
+                if sl_trigger >= current_price:
+                    logger.warning(f"⚠️ [OCO] 손절가({sl_trigger}) >= 현재가({current_price}). 현재가 -0.5%로 보정")
+                    sl_trigger = current_price * 0.995
+                
+                # 익절가가 현재가보다 낮거나 같으면 실패함 -> 현재가보다 0.5% 위로 강제 조정
+                if tp_price <= current_price:
+                    logger.warning(f"⚠️ [OCO] 익절가({tp_price}) <= 현재가({current_price}). 현재가 +0.5%로 보정")
+                    tp_price = current_price * 1.005
+
             # [New] 최소 간격 보정 (1% Rule) - 거절 방지
             min_gap = buy_price * 0.01
             current_gap = tp_price - sl_trigger
             
             if current_gap < min_gap:
-                logger.warning(f"⚠️ [OCO] 익절/손절 간격 부족({current_gap:.2f} < {min_gap:.2f}). 1% 간격으로 자동 보정합니다.")
-                mid_price = (tp_price + sl_trigger) / 2
-                tp_price = mid_price + (min_gap / 2)
-                sl_trigger = mid_price - (min_gap / 2)
+                # 간격 부족 시 익절가는 올리고 손절가는 내려서 간격 확보
+                diff = min_gap - current_gap
+                tp_price += diff / 2
+                sl_trigger -= diff / 2
+                logger.warning(f"⚠️ [OCO] 가격 간격 보정: 익절↑ 손절↓ (Gap: {min_gap})")
 
             # 정밀도 보정 (BinanceAPI.adjust_price_unit 사용)
             tp_price = self.adjust_price_unit(symbol, tp_price)
@@ -1141,6 +1237,16 @@ class BinanceAPI(BaseAPI):
             # 손절 리밋 (Stop Limit Price) - 트리거보다 0.5% 낮게 설정하여 급락 시 체결 확률 확보
             sl_limit = sl_trigger * 0.995
             sl_limit = self.adjust_price_unit(symbol, sl_limit)
+            
+            # [Safety] Stop Limit이 Trigger보다 높으면 안됨 (매도 기준)
+            if sl_limit > sl_trigger:
+                sl_limit = sl_trigger
+
+            # [Fix] 최소 주문 금액 확인 (10 USDT)
+            notional = qty * sl_limit
+            if notional < 10:
+                logger.warning(f"⚠️ [OCO] 주문 금액({notional:.2f} USDT)이 최소 한도(10 USDT) 미만입니다. 주문 불가.")
+                return {}
 
             # 3. OCO 주문 전송
             logger.info(f"🛡️ [OCO] 주문 시도: {symbol} {qty}개 | 익절: {tp_price} | 손절: {sl_trigger}(Limit {sl_limit})")
@@ -1357,7 +1463,19 @@ class BinanceAPI(BaseAPI):
         # 기존 연결 종료
         if self.ws_app:
             self.ws_app.close()
+        # [Fix] 기존 연결 안전하게 종료 후 재시작 (스레드 중복 방지)
+        if self.use_websocket:
+            logger.info("🔄 [BINANCE] 기존 WebSocket 연결 종료 중...")
+            self.use_websocket = False # 루프 종료 신호
+            if self.ws_app:
+                self.ws_app.close()
+            # 기존 스레드가 종료될 때까지 잠시 대기 (최대 2초)
+            if self.wst and self.wst.is_alive():
+                self.wst.join(timeout=2.0)
             
+        self.use_websocket = True
+        self.is_ws_ready = False # 초기화
+
         # 별도 스레드에서 실행 (비동기 병렬 처리)
         self.wst = threading.Thread(target=self._ws_run_loop)
         self.wst.daemon = True
@@ -1415,6 +1533,8 @@ class BinanceAPI(BaseAPI):
 
     def _ws_run_loop(self):
         """웹소켓 실행 루프 (Auto-Reconnect)"""
+        logger.info("🧵 [BINANCE] WebSocket 스레드 시작")
+        
         while self.use_websocket:
             try:
                 # 스트림 URL 생성
@@ -1439,13 +1559,19 @@ class BinanceAPI(BaseAPI):
                 logger.error(f"❌ [BINANCE] WebSocket 오류: {e}")
                 self._notify_error(f"WebSocket 런타임 오류: {e}")
             
+            # [Fix] run_forever()가 종료된 후, 의도된 종료가 아니면 재연결 시도
             if self.use_websocket:
                 self.retry_count += 1
                 wait_time = min(60, 5 * (2 ** (self.retry_count - 1)))
                 logger.warning(f"⚠️ [BINANCE] WebSocket 연결 끊김. {wait_time}초 후 재연결... ({self.retry_count}회)")
                 self._notify_error(f"WebSocket 연결 끊김. {wait_time}초 후 재연결 시도...")
-                self.is_ws_ready = False # [요청사항 1] 초기값 대기 상태로 전환
+                self.is_ws_ready = False
                 time.sleep(wait_time)
+            else:
+                logger.info("🔒 [BINANCE] WebSocket 루프가 의도적으로 종료되었습니다.")
+                break
+        
+        logger.info("🏁 [BINANCE] WebSocket 스레드 완전 종료")
 
     def _on_open(self, ws):
         logger.info("✅ [BINANCE] WebSocket 연결 수립")

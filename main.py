@@ -8,6 +8,7 @@ import logging
 import time
 import os
 import sys
+import subprocess
 
 # [Fix] TensorFlow 로그 노이즈 제거 (oneDNN 최적화 메시지 및 INFO 로그 숨김)
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -37,6 +38,10 @@ from models.ml_model import MLPredictor
 from trading.strategy import MLStrategy, TechnicalStrategy
 from trading.strategy_v2 import HeikinAshiStrategy
 from trading.turtle_bollinger_strategy import TurtleBollingerStrategy
+from trading.agile_strategy import AgileStrategy
+from trading.ma_trend_strategy import MATrendStrategy
+from trading.volume_trend_strategy import VolumeTrendStrategy
+from trading.early_bird_strategy import EarlyBirdStrategy
 from utils.report_manager import ReportManager
 from trading.portfolio import Portfolio
 from trading.risk_manager import RiskManager
@@ -201,22 +206,8 @@ class AutoTradingBot:
         self.ml_strategy = MLStrategy(self.ml_model, ML_CONFIG["lookback_window"])
         self.technical_strategy = TechnicalStrategy(ML_CONFIG["lookback_window"])
 
-        # 설정에 따라 사용할 암호화폐 전략 선택 (동적 로딩 지원)
-        strategy_type = TRADING_CONFIG["crypto"].get("strategy_type", "technical")
-        entry_strategy = TRADING_CONFIG["crypto"].get("entry_strategy", "breakout")
-        
-        if entry_strategy == "heikin_ashi":
-            self.crypto_strategy = HeikinAshiStrategy(ML_CONFIG["lookback_window"])
-            logger.info("🤖 암호화폐 메인 전략으로 'HeikinAshiStrategy'를 사용합니다.")
-        elif entry_strategy == "turtle_bollinger":
-            self.crypto_strategy = TurtleBollingerStrategy(ML_CONFIG["lookback_window"])
-            logger.info("🤖 암호화폐 메인 전략으로 'TurtleBollingerStrategy'를 사용합니다.")
-        elif strategy_type == "ml":
-            self.crypto_strategy = self.ml_strategy
-            logger.info("🤖 암호화폐 메인 전략으로 'MLStrategy'를 사용합니다.")
-        else:
-            self.crypto_strategy = self.technical_strategy
-            logger.info("🤖 암호화폐 메인 전략으로 'TechnicalStrategy'를 사용합니다.")
+        # [Refactor] 전략 객체 초기화 (메서드로 분리하여 재사용)
+        self._initialize_strategies()
 
         logger.info("5. 리스크 관리자 및 스케줄러 설정")
         # 위험 관리 초기화
@@ -462,6 +453,32 @@ class AutoTradingBot:
         except Exception as e:
             logger.error(f"동적 설정 로드 오류: {e}")
 
+    def _initialize_strategies(self):
+        """전략 객체 초기화 및 갱신 (설정 변경 시 호출)"""
+        self.strategies = {}
+        for key in ["crypto", "binance_spot", "binance_futures"]:
+            entry_strategy = TRADING_CONFIG[key].get("entry_strategy", "breakout")
+            strategy_type = TRADING_CONFIG[key].get("strategy_type", "technical")
+            
+            if entry_strategy == "heikin_ashi":
+                self.strategies[key] = HeikinAshiStrategy(ML_CONFIG["lookback_window"])
+            elif entry_strategy == "turtle_bollinger":
+                self.strategies[key] = TurtleBollingerStrategy(ML_CONFIG["lookback_window"])
+            elif entry_strategy == "agile":
+                self.strategies[key] = AgileStrategy(ML_CONFIG["lookback_window"])
+            elif entry_strategy == "volume_trend":
+                self.strategies[key] = VolumeTrendStrategy(ML_CONFIG["lookback_window"])
+            elif entry_strategy == "ma_trend":
+                self.strategies[key] = MATrendStrategy(ML_CONFIG["lookback_window"])
+            elif entry_strategy == "early_bird":
+                self.strategies[key] = EarlyBirdStrategy(ML_CONFIG["lookback_window"])
+            elif strategy_type == "ml":
+                self.strategies[key] = self.ml_strategy
+            else:
+                self.strategies[key] = self.technical_strategy
+            
+            logger.info(f"🤖 [{key.upper()}] 적용 전략 갱신: {type(self.strategies[key]).__name__} (Mode: {entry_strategy})")
+
     def check_env_updates(self):
         """
         .env 파일 변경 감지 및 Hot-Reload
@@ -487,7 +504,7 @@ class AutoTradingBot:
                 self.last_env_mtime = mtime
                 
                 from dotenv import load_dotenv
-                load_dotenv(override=True)
+                load_dotenv(env_path, override=True) # [Fix] 명시적으로 .env 파일만 리로드
                 
                 # 주요 설정값 갱신
                 TRADING_CONFIG["crypto"]["k_value"] = float(os.getenv("CRYPTO_K_VALUE", 0.6))
@@ -496,7 +513,20 @@ class AutoTradingBot:
                 if stop_loss > 0:
                     TRADING_CONFIG["crypto"]["stop_loss_percent"] = stop_loss
                 
-                logger.info(f"✅ 설정 갱신 완료: Strategy={TRADING_CONFIG['crypto']['entry_strategy']}, K={TRADING_CONFIG['crypto']['k_value']}")
+                # [New] 바이낸스 설정 갱신 추가
+                TRADING_CONFIG["binance_spot"]["entry_strategy"] = os.getenv("BINANCE_SPOT_ENTRY_STRATEGY", "breakout")
+                TRADING_CONFIG["binance_futures"]["entry_strategy"] = os.getenv("BINANCE_FUTURES_ENTRY_STRATEGY", "breakout")
+                
+                # [New] 바이낸스 파라미터 갱신 (TP/SL)
+                TRADING_CONFIG["binance_spot"]["take_profit_percent"] = float(os.getenv("BINANCE_SPOT_TAKE_PROFIT", TRADING_CONFIG["binance_spot"]["take_profit_percent"]))
+                TRADING_CONFIG["binance_spot"]["stop_loss_percent"] = float(os.getenv("BINANCE_SPOT_STOP_LOSS", 0.0))
+                TRADING_CONFIG["binance_futures"]["take_profit_percent"] = float(os.getenv("BINANCE_FUTURES_TAKE_PROFIT", TRADING_CONFIG["binance_futures"]["take_profit_percent"]))
+                TRADING_CONFIG["binance_futures"]["stop_loss_percent"] = float(os.getenv("BINANCE_FUTURES_STOP_LOSS", 0.0))
+
+                # 전략 객체 재초기화 (클래스 변경 대응)
+                self._initialize_strategies()
+                
+                logger.info(f"✅ 설정 갱신 완료 (Hot-Reload)")
         except Exception as e:
             logger.error(f"설정 리로드 중 오류: {e}")
 
@@ -773,6 +803,7 @@ class AutoTradingBot:
         """봇 시작 시 현재 설정 요약 전송"""
         try:
             from config.settings import selected_strategy_name
+            from config.settings import selected_strategy_name, spot_strategy_name, futures_strategy_name
             
             msg = "🤖 *자동매매 봇 시작 알림*\n\n"
             msg += f"📌 *적용 전략*: `{selected_strategy_name.upper()}`\n"
@@ -780,6 +811,8 @@ class AutoTradingBot:
             # Crypto Config
             c_conf = TRADING_CONFIG["crypto"]
             msg += "\n📊 *[UPBIT] 설정*\n"
+            msg += f"📊 *[UPBIT] 설정 ({selected_strategy_name.upper()})*\n"
+            msg += f"• 진입전략: `{c_conf.get('entry_strategy', 'Unknown')}`\n"
             msg += f"• 타임프레임: `{c_conf['timeframe']}`\n"
             msg += f"• K-Value: `{c_conf['k_value']}`\n"
             msg += f"• 익절률: `{c_conf['take_profit_percent']*100:.1f}%`\n"
@@ -791,15 +824,22 @@ class AutoTradingBot:
             if getattr(self, 'binance_spot_api', None):
                 b_conf = TRADING_CONFIG["binance_spot"]
                 msg += "\n📊 *[BINANCE SPOT] 설정*\n"
+                msg += f"\n📊 *[BINANCE SPOT] 설정 ({spot_strategy_name.upper()})*\n"
+                msg += f"• 진입전략: `{b_conf.get('entry_strategy', 'Unknown')}`\n"
                 msg += f"• 타임프레임: `{b_conf['timeframe']}`\n"
                 msg += f"• 익절률: `{b_conf['take_profit_percent']*100:.1f}%`\n"
+                msg += f"• 트레일링스탑: `{b_conf.get('trailing_stop_percent', 0)*100:.1f}%`\n"
 
             # Binance Futures
             if getattr(self, 'binance_futures_api', None):
                 b_conf = TRADING_CONFIG["binance_futures"]
                 msg += "\n📊 *[BINANCE FUTURES] 설정*\n"
+                msg += f"\n📊 *[BINANCE FUTURES] 설정 ({futures_strategy_name.upper()})*\n"
+                msg += f"• 진입전략: `{b_conf.get('entry_strategy', 'Unknown')}`\n"
                 msg += f"• 타임프레임: `{b_conf['timeframe']}`\n"
                 msg += f"• 레버리지: `{b_conf.get('leverage', 1)}x`\n"
+                msg += f"• 익절률: `{b_conf['take_profit_percent']*100:.1f}%`\n"
+                msg += f"• 트레일링스탑: `{b_conf.get('trailing_stop_percent', 0)*100:.1f}%`\n"
             
             self._send_telegram_alert(msg, parse_mode="Markdown")
             logger.info("✅ 설정 요약 텔레그램 전송 완료")
@@ -915,96 +955,160 @@ class AutoTradingBot:
         except Exception as e:
             logger.error(f".env 파일 업데이트 오류: {e}")
 
-    def optimize_k_value(self):
-        """K값 자동 최적화 (최근 7일 데이터 기준 승률 분석)"""
+    def run_periodic_backtest(self, wait: bool = False):
+        """정기 백테스트 및 설정 최적화 실행 (별도 프로세스)"""
+        logger.info("🧪 [Scheduler] 정기 백테스트 및 최적화 작업 시작...")
+        try:
+            # 스크립트 경로 (main.py와 같은 폴더에 있다고 가정)
+            if getattr(sys, 'frozen', False):
+                base_dir = os.path.dirname(os.path.abspath(sys.executable))
+                # [Fix] 빌드된 환경에서는 별도 실행 파일(Backtester) 실행
+                if sys.platform == "win32":
+                    target_exe = os.path.join(base_dir, "Backtester.exe")
+                else:
+                    target_exe = os.path.join(base_dir, "Backtester")
+                
+                if os.path.exists(target_exe):
+                    if wait:
+                        self._send_telegram_alert("⏳ *[시스템 알림]*\n봇 초기화 중... 최신 데이터를 기반으로 전략 최적화를 진행합니다.\n(약 1~3분 소요)", parse_mode="Markdown")
+                        logger.info("⏳ 초기 백테스트 실행 중... (완료 시까지 대기)")
+                        subprocess.call([target_exe], cwd=base_dir)
+                        logger.info("✅ 초기 백테스트 완료. 설정을 갱신합니다.")
+                        self.check_env_updates()
+                    else:
+                        subprocess.Popen([target_exe], cwd=base_dir)
+                        logger.info(f"🚀 백테스트 프로세스(EXE) 시작: {target_exe}")
+                else:
+                    logger.error(f"❌ 백테스트 실행 파일을 찾을 수 없습니다: {target_exe}")
+                return
+            else:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                script_path = os.path.join(base_dir, "run_backtest_all.py")
+                
+                if not os.path.exists(script_path):
+                    logger.error(f"❌ 백테스트 스크립트를 찾을 수 없습니다: {script_path}")
+                    return
+
+                # 비동기 실행 (봇 메인 루프 차단 방지)
+                if wait:
+                    self._send_telegram_alert("⏳ *[시스템 알림]*\n봇 초기화 중... 최신 데이터를 기반으로 전략 최적화를 진행합니다.\n(약 1~3분 소요)", parse_mode="Markdown")
+                    logger.info("⏳ 초기 백테스트 실행 중... (완료 시까지 대기)")
+                    subprocess.call([sys.executable, script_path], cwd=base_dir)
+                    logger.info("✅ 초기 백테스트 완료. 설정을 갱신합니다.")
+                    self.check_env_updates()
+                else:
+                    subprocess.Popen([sys.executable, script_path], cwd=base_dir)
+                    logger.info("🚀 백테스트 프로세스(Script)가 백그라운드에서 시작되었습니다.")
+            
+        except Exception as e:
+            logger.error(f"백테스트 실행 중 오류: {e}")
+
+    def optimize_strategy_params(self):
+        """전략 파라미터(K, 익절, 손절) 자동 최적화"""
         if not self.crypto_api: return
 
-        logger.info("⚙️ K값 자동 최적화 시작 (최근 7일 데이터 분석)...")
+        logger.info("⚙️ 전략 파라미터(K, TP, SL) 자동 최적화 시작 (최근 7일 데이터)...")
         
-        # 테스트할 K값 범위
-        k_candidates = [0.4, 0.5, 0.6, 0.7]
+        # 최적화 후보군 (Grid Search) - 핵심 값 위주로 테스트
+        k_candidates = [0.4, 0.5, 0.6]
+        tp_candidates = [0.03, 0.05, 0.10] # 3%, 5%, 10%
+        sl_candidates = [0.01, 0.03, 0.05] # 1%, 3%, 5%
         
-        # 분석 대상 종목 (거래량 상위 및 주요 코인)
+        # 분석 대상 종목
         targets = ["BTC/KRW", "ETH/KRW", "XRP/KRW", "SOL/KRW"]
-        # 현재 포트폴리오나 감시 종목도 포함
-        targets.extend(self.crypto_symbols[:3])
+        targets.extend(self.crypto_symbols[:2]) # 상위 2개 추가
         targets = list(set(targets))
         
-        best_k = TRADING_CONFIG["crypto"]["k_value"]
-        best_score = -1.0
+        # 현재 설정값
+        current_k = TRADING_CONFIG["crypto"]["k_value"]
+        current_tp = TRADING_CONFIG["crypto"]["take_profit_percent"]
+        current_sl = TRADING_CONFIG["crypto"]["stop_loss_percent"]
         
-        # 현재 설정 백업
-        original_k = TRADING_CONFIG["crypto"]["k_value"]
+        best_params = (current_k, current_tp, current_sl)
+        best_score = -1.0 # 승률 기준
+        
+        # 원본 설정 백업 (오류 시 복구용)
+        original_config = {
+            "k": current_k,
+            "tp": current_tp,
+            "sl": current_sl
+        }
         
         try:
-            results = {}
-            report_msg = "⚙️ [K-Value 최적화 결과]\n"
+            import itertools
+            combinations = list(itertools.product(k_candidates, tp_candidates, sl_candidates))
             
-            for k in k_candidates:
-                # 전역 설정 임시 변경 (TechnicalStrategy가 참조함)
+            logger.info(f"🧪 총 {len(combinations)}개 파라미터 조합 테스트 진행...")
+            
+            for k, tp, sl in combinations:
+                # K값은 전략 내부 로직에 영향을 주므로 설정 변경 필요
                 TRADING_CONFIG["crypto"]["k_value"] = k
                 
                 total_trades = 0
                 total_wins = 0
                 
                 for symbol in targets:
-                    # 최근 7일 데이터 확보 (15분봉 기준 약 672개 -> 넉넉히 1000개)
-                    df = self.crypto_api.get_ohlcv(symbol, timeframe="15m", count=1000)
+                    # 데이터 수집 (캐싱 활용, 15분봉 500개)
+                    df = self.crypto_api.get_ohlcv(symbol, timeframe="15m", count=500)
                     if df.empty or len(df) < 100: continue
                     
-                    # 최근 7일 구간 슬라이싱
-                    test_len = min(len(df), 700)
+                    # 최근 데이터로 테스트
+                    test_len = min(len(df), 480)
                     test_data = df.tail(test_len)
                     
-                    # 백테스팅 실행 (TechnicalStrategy - Breakout)
-                    # WalkForwardAnalyzer의 내부 로직 활용
                     analyzer = WalkForwardAnalyzer(
                         test_data, 
-                        train_period=20, # 최소 학습 기간
-                        test_period=len(test_data)-50, # 전체 통으로 테스트
+                        train_period=20,
+                        test_period=len(test_data)-50,
                         fee=0.0005,
-                        slippage=0.001
+                        slippage=0.001,
+                        take_profit=tp,  # 익절 적용
+                        stop_loss=sl     # 손절 적용
                     )
                     
-                    # 전략 객체 생성 (변경된 K값 적용됨)
                     strategy = TechnicalStrategy(lookback_window=20)
-                    
-                    # 백테스트 수행
                     res = analyzer._backtest_period(strategy, test_data, lookback=50)
                     
                     if res['trade_count'] > 0:
                         total_trades += res['trade_count']
                         total_wins += (res['win_rate'] * res['trade_count'])
                 
-                # 가중 평균 승률 계산
                 avg_win_rate = total_wins / total_trades if total_trades > 0 else 0
-                results[k] = avg_win_rate
-                logger.info(f"   - K={k}: 승률 {avg_win_rate*100:.1f}% (거래 {total_trades}회)")
-                report_msg += f"- K={k}: 승률 {avg_win_rate*100:.1f}% ({total_trades}회)\n"
                 
                 if avg_win_rate > best_score:
                     best_score = avg_win_rate
-                    best_k = k
+                    best_params = (k, tp, sl)
             
             # 최적값 적용
-            if best_k != original_k:
-                logger.info(f"✅ 최적 K값 발견: {original_k} -> {best_k} (승률 {best_score*100:.1f}%)")
-                report_msg += f"\n🔄 설정 변경: {original_k} -> {best_k}"
-                self._update_env_file("CRYPTO_K_VALUE", str(best_k))
-                TRADING_CONFIG["crypto"]["k_value"] = best_k
-            else:
-                logger.info(f"ℹ️ 현재 K값({original_k})이 최적입니다. (승률 {best_score*100:.1f}%)")
-                report_msg += f"\nℹ️ 현재 설정({original_k}) 유지"
+            new_k, new_tp, new_sl = best_params
             
-            # 텔레그램 알림 전송
-            self._send_telegram_alert(report_msg)
+            if best_params != (current_k, current_tp, current_sl):
+                logger.info(f"✅ 최적 파라미터 발견! (승률 {best_score*100:.1f}%)")
+                logger.info(f"   K: {current_k} -> {new_k}")
+                logger.info(f"   TP: {current_tp*100:.1f}% -> {new_tp*100:.1f}%")
+                logger.info(f"   SL: {current_sl*100:.1f}% -> {new_sl*100:.1f}%")
+                
+                self._update_env_file("CRYPTO_K_VALUE", str(new_k))
+                self._update_env_file("CRYPTO_TAKE_PROFIT", str(new_tp))
+                self._update_env_file("CRYPTO_STOP_LOSS", str(new_sl))
+                
+                TRADING_CONFIG["crypto"]["k_value"] = new_k
+                TRADING_CONFIG["crypto"]["take_profit_percent"] = new_tp
+                TRADING_CONFIG["crypto"]["stop_loss_percent"] = new_sl
+                
+                # 리스크 관리자에도 반영
+                self.crypto_risk_manager.take_profit_percent = new_tp
+                
+                self._send_telegram_alert(f"⚙️ [AUTO_OPT] 전략 파라미터 최적화 완료\nK: {new_k}\nTP: {new_tp*100:.1f}%\nSL: {new_sl*100:.1f}%\n(예상 승률: {best_score*100:.1f}%)")
+            else:
+                logger.info("ℹ️ 현재 설정이 최적입니다.")
+                # 설정 원복 (K값 등)
+                TRADING_CONFIG["crypto"]["k_value"] = current_k
                 
         except Exception as e:
-            logger.error(f"K값 최적화 중 오류: {e}")
-        finally:
-            # 오류 발생 시 원복 (성공 시에는 위에서 이미 best_k로 설정됨)
-            if TRADING_CONFIG["crypto"]["k_value"] != best_k:
-                TRADING_CONFIG["crypto"]["k_value"] = original_k
+            logger.error(f"파라미터 최적화 중 오류: {e}")
+            # 오류 시 원복
+            TRADING_CONFIG["crypto"]["k_value"] = original_config["k"]
 
     def find_best_k(self):
         """
@@ -1085,14 +1189,16 @@ class AutoTradingBot:
         else:
             base_dir = os.path.dirname(os.path.abspath(__file__))
             
-        models_dir = os.path.join(base_dir, "models")
+        # [Fix] 설정 파일에서 모델 폴더명 로드 (기본값: models)
+        models_folder = ML_CONFIG.get("models_dir", "models")
+        models_dir = os.path.join(base_dir, models_folder)
         
         # [New] 사용자가 경로를 명확히 알 수 있도록 로그 출력
         logger.info(f"📂 모델 파일 저장 경로: {models_dir}")
         
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
-            logger.info(f"📂 models 폴더를 생성했습니다: {models_dir}")
+            logger.info(f"📂 {models_folder} 폴더를 생성했습니다: {models_dir}")
 
         try:
             # 여러 API에서 데이터 수집
@@ -1177,8 +1283,8 @@ class AutoTradingBot:
         # 2. 시장 분석 및 전략 자동 업데이트
         self.recommend_strategy(auto_update=True)
         
-        # 3. K값 자동 최적화 (매일 자정 갱신)
-        self.optimize_k_value()
+        # 3. 전략 파라미터 자동 최적화 (매일 아침 갱신)
+        self.optimize_strategy_params()
         
         # 4. 동적 설정(K값 등) 다시 로드
         self.load_dynamic_config()
@@ -1340,7 +1446,8 @@ class AutoTradingBot:
             
             # [New] 활성화된 API가 없는 경우 경고 출력 (이동 시 .env 누락 확인용)
             if not any(api for _, api in apis):
-                logger.warning("⚠️ [학습 중단] 연결된 API가 없습니다. .env 파일이 실행 파일과 같은 폴더에 있는지 확인하세요.")
+                # logger.warning("⚠️ [학습 중단] 연결된 API가 없습니다. .env 파일이 실행 파일과 같은 폴더에 있는지 확인하세요.")
+                # 한국 주식 API가 없으면 조용히 리턴 (암호화폐 전용 모드)
                 return
 
             for api_name, api in apis:
@@ -1369,7 +1476,7 @@ class AutoTradingBot:
                         sell_fee = TRADING_CONFIG["fees"]["stock_fee_rate"] + TRADING_CONFIG["fees"]["stock_tax_rate"]
 
                         if result:
-                            self.stock_portfolio.add_position(symbol, quantity, current_price, fee_rate=buy_fee)
+                            self.stock_portfolio.add_position(symbol, quantity, current_price, fee_rate=buy_fee, atr_value=signal.atr_value if signal else 0.0)
                             self.stock_risk_manager.set_stop_loss(symbol, current_price, atr_value=signal.atr_value if signal else 0.0)
                             # 익절 목표가에 매수+매도 수수료 포함
                             self.stock_risk_manager.set_take_profit(symbol, current_price, fee_rate=buy_fee + sell_fee)
@@ -1448,12 +1555,27 @@ class AutoTradingBot:
             api_positions = api.get_positions()
             api_pos_map = {p['symbol']: p for p in api_positions}
             
+            # [New] 최소 주문 금액 기준 가져오기 (Dust 필터링용)
+            config_key = "crypto" if currency == "KRW" else "binance_futures" if getattr(api, 'is_future', False) else "binance_spot"
+            min_order_amount = TRADING_CONFIG.get(config_key, {}).get("min_order_amount", 0)
+
             for sym, data in api_pos_map.items():
                 qty = data['quantity']
                 price = data['entry_price']
                 
                 should_sync = False
                 if sym not in portfolio.positions:
+                    # [Fix] 신규 발견 시 Dust(소액) 여부 체크하여 무시
+                    # 매매 불가능한 소액 잔고가 계속 재등록되는 것을 방지 (특히 BNB 수수료 잔고)
+                    if min_order_amount > 0:
+                        current_p = api.get_price(sym)
+                        # 가격 조회 성공 시 가치 계산
+                        if current_p > 0:
+                            val = qty * current_p
+                            if val < min_order_amount:
+                                logger.debug(f"🧹 [SYNC] {sym} 소액 잔고 무시 (가치: {val:.2f} < 최소: {min_order_amount})")
+                                continue
+
                     logger.warning(f"⚠️ [SYNC_WARNING] {sym} 거래소에는 존재하나 봇 포트폴리오에 없는 종목 발견! (수량: {qty}) -> 장부에 신규 등록합니다.")
                     should_sync = True
                 elif abs(portfolio.positions[sym] - qty) > 0.00000001:
@@ -1468,11 +1590,33 @@ class AutoTradingBot:
                         price = portfolio.entry_prices[sym]
                         logger.debug(f"ℹ️ [SYNC] {sym} API 평단가 0 -> 기존 장부가({price}) 유지")
 
-                    portfolio.sync_position(sym, qty, price)
+                    # [Fix] 저장된 ATR 값 복원 (재시작 시 정보 유지)
+                    saved_atr = portfolio.atr_values.get(sym, 0.0)
+                    
                     if sym not in risk_manager.stop_loss_prices:
                         fee_rate = TRADING_CONFIG["fees"].get("binance_fee_rate" if currency == "USDT" else "crypto_fee_rate", 0.001)
-                        risk_manager.set_stop_loss(sym, price, atr_value=0.0)
-                        risk_manager.set_take_profit(sym, price, fee_rate=fee_rate * 2)
+                        
+                        # [Fix] Sync 시 ATR 계산하여 동적 손절가 복원 (재시작 후에도 리스크 관리 유지)
+                        # 저장된 값이 있으면 우선 사용, 없으면 재계산
+                        atr_value = saved_atr
+                        
+                        try:
+                            # 최근 데이터 조회하여 ATR 계산
+                            timeframe = TRADING_CONFIG["crypto"].get("timeframe", "15m")
+                            # _get_latest_ohlcv는 캐싱되므로 부담 적음
+                            df = self._get_latest_ohlcv(api, sym, timeframe)
+                            if not df.empty and len(df) >= 20:
+                                atr_indicator = AverageTrueRange(df['high'], df['low'], df['close'], window=14)
+                                current_atr = atr_indicator.average_true_range().iloc[-1]
+                                if atr_value <= 0: # 저장된 값이 없을 때만 현재 값 사용
+                                    atr_value = current_atr
+                        except Exception:
+                            pass
+
+                        risk_manager.set_stop_loss(sym, price, atr_value=atr_value)
+                        risk_manager.set_take_profit(sym, price, fee_rate=fee_rate * 2, atr_value=atr_value)
+                    
+                    portfolio.sync_position(sym, qty, price, atr_value=saved_atr)
             
             for sym in list(portfolio.positions.keys()):
                 if sym not in api_pos_map:
@@ -1568,13 +1712,14 @@ class AutoTradingBot:
                 
         return df
 
-    def _execute_sell(self, api, portfolio, risk_manager, symbol, current_price, exit_reason, fee_rate, save_path):
+    def _execute_sell(self, api, portfolio, risk_manager, symbol, current_price, exit_reason, fee_rate, save_path, quantity=None):
         """매도 실행 공통 로직 (정기 매매 & 실시간 매매 공용)"""
         try:
             # [New] 거래소 이름 식별
             exchange_name = "UPBIT" if isinstance(api, UpbitAPI) else "BINANCE_FUTURES" if getattr(api, 'is_future', False) else "BINANCE_SPOT"
 
-            quantity = portfolio.positions.get(symbol, 0)
+            if quantity is None:
+                quantity = portfolio.positions.get(symbol, 0)
             if quantity <= 0:
                 return
 
@@ -1586,6 +1731,32 @@ class AutoTradingBot:
             min_order = 5000 if "KRW" in symbol else 10
             if current_value < min_order:
                 logger.warning(f"[{exchange_name}] ⚠️ 매도 금액({current_value:,.0f})이 최소 주문 금액({min_order}) 미만입니다. 매도 불가.")
+                # [Fix] 로그 포맷 개선 (소수점 표시 및 메시지 명확화)
+                logger.warning(f"[{exchange_name}] ⚠️ [DUST] {symbol} 잔고 가치({current_value:.2f})가 최소 주문 금액({min_order}) 미만입니다. 매도 불가.")
+                
+                # [New] 바이낸스 현물인 경우 소액 잔고(Dust)를 BNB로 변환 시도
+                if isinstance(api, BinanceAPI) and not getattr(api, 'is_future', False):
+                    try:
+                        target_coin = symbol.split('/')[0]
+                        # [Fix] BNB는 BNB로 변환할 수 없으므로 제외
+                        if target_coin != "BNB":
+                            logger.info(f"🧹 [BINANCE] {target_coin} 소액 잔고(Dust) BNB 변환 시도...")
+                            api.convert_dust_to_bnb([target_coin])
+                            # [Fix] 중복 호출 제거 (아래에서 result를 받아서 처리)
+                            result = api.convert_dust_to_bnb([target_coin])
+                            if result and result.get('totalTransfered'):
+                                bnb_amount = result.get('totalTransfered')
+                                self._send_telegram_alert(f"🧹 [DUST] {target_coin} 소액 잔고가 BNB로 변환되었습니다.\n변환 수량: {bnb_amount} BNB")
+                    except Exception as e:
+                        logger.error(f"BNB 변환 실패: {e}")
+
+                # [Fix] 최소 금액 미만인 경우 무한 루프 방지를 위해 포트폴리오에서 제거 (Dust 처리)
+                logger.warning(f"[{exchange_name}] 🗑️ 거래 불가능한 소액 잔고(Dust)로 판단하여 봇 관리 목록에서 제외합니다: {symbol}")
+                portfolio.remove_position(symbol)
+                risk_manager.remove_position(symbol)
+                portfolio.save_state(save_path)
+                self._send_telegram_alert(f"⚠️ [DUST] {symbol} 잔고가 최소 주문 금액 미만({current_value:.2f} < {min_order})이라 매도할 수 없습니다. 봇 관리에서 제외합니다.")
+                # [Fix] 반복적인 Dust 경고 알림은 로그로만 남기고 텔레그램 전송 중단 (알림 폭탄 방지)
                 return
 
             # [수정] 손절 여부 확인
@@ -1639,16 +1810,6 @@ class AutoTradingBot:
                 elif "break-even" in reason_lower or "본절" in reason_lower:
                     tag = "[본절보존]"
 
-                risk_manager.remove_position(symbol)
-                portfolio.save_state(save_path)
-                sell_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                logger.warning("="*70)
-                logger.warning(f"[{exchange_name}] {tag} [{symbol.split('/')[1]}] {symbol}")
-                logger.warning(f"시간: {sell_time} | 수량: {quantity}")
-                logger.warning(f"매입가: {entry_price:,.0f}원 | 매도가: {current_price:,.0f}원")
-                logger.warning(f"실현손익: {pnl:,.0f}원 (수익률: {pnl_percent:+.2f}%) | 사유: {exit_reason}{liq_info}")
-                logger.warning("="*70)
-                
                 # [요청사항 5] 바이낸스 선물 레버리지 정보 추가
                 leverage = None
                 liq_info = ""
@@ -1661,6 +1822,16 @@ class AutoTradingBot:
                             dist_pct = risk_data.get('distance_pct', 0) * 100
                             liq_price = risk_data.get('liquidation_price', 0)
                             liq_info = f" | 청산가: {liq_price:,.4f} (거리: {dist_pct:.2f}%)"
+
+                risk_manager.remove_position(symbol)
+                portfolio.save_state(save_path)
+                sell_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                logger.warning("="*70)
+                logger.warning(f"[{exchange_name}] {tag} [{symbol.split('/')[1]}] {symbol}")
+                logger.warning(f"시간: {sell_time} | 수량: {quantity}")
+                logger.warning(f"매입가: {entry_price:,.0f}원 | 매도가: {current_price:,.0f}원")
+                logger.warning(f"실현손익: {pnl:,.0f}원 (수익률: {pnl_percent:+.2f}%) | 사유: {exit_reason}{liq_info}")
+                logger.warning("="*70)
 
                 # [New] 텔레그램 알림 전송
                 if self.report_manager:
@@ -1857,10 +2028,10 @@ class AutoTradingBot:
                             risk_manager.entry_prices[symbol] = entry_price
                         portfolio.save_state(save_path)
 
-                    if entry_price > 0 and current_price < (entry_price * 0.9):
-                        exit_reason = "Emergency Stop Loss (Hard Limit -10%)"
-                        logger.warning(f"🚨 {symbol} 비상 손절 발동! (현재가 {current_price:,.0f} < 평단가 {entry_price:,.0f}의 90%)")
-                        self._send_telegram_alert(f"🚨 [긴급 매도] {symbol} 비상 손절(-10%) 발동!\n현재가: {current_price:,.0f}원")
+                    if entry_price > 0 and current_price < (entry_price * 0.95):
+                        exit_reason = "Emergency Stop Loss (Hard Limit -5%)"
+                        logger.warning(f"🚨 {symbol} 비상 손절 발동! (현재가 {current_price:,.0f} < 평단가 {entry_price:,.0f}의 95%)")
+                        self._send_telegram_alert(f"🚨 [긴급 매도] {symbol} 비상 손절(-5%) 발동!\n현재가: {current_price:,.0f}원")
                         
                         fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if "binance" in config_key else TRADING_CONFIG["fees"]["crypto_fee_rate"]
                         self._execute_sell(api, portfolio, risk_manager, symbol, current_price, exit_reason, fee, save_path)
@@ -1874,10 +2045,25 @@ class AutoTradingBot:
                     if not exit_reason:
                         timeframe = TRADING_CONFIG[config_key].get("timeframe", "1d")
                         data = api.get_ohlcv(symbol, timeframe) # 캐싱 미적용 (간소화)
+                        
                         if not data.empty:
-                            signal = self.crypto_strategy.generate_signal(symbol, data, portfolio.current_capital)
+                            # [New] 전략에 포지션 정보 전달 (동적 청산용)
+                            pos_qty = portfolio.positions.get(symbol, 0)
+                            entry_prc = portfolio.entry_prices.get(symbol, 0)
+                            
+                            signal = self.strategies[config_key].generate_signal(
+                                symbol, data, portfolio.current_capital, 
+                                entry_price=entry_prc, position_quantity=pos_qty
+                            )
                             if signal and signal.action == "SELL":
                                 exit_reason = f"전략 매도 신호 ({signal.reason})"
+                                # [New] 부분 매도 지원
+                                if signal.suggested_quantity > 0:
+                                    sell_qty = signal.suggested_quantity
+                                    logger.info(f"[{exchange_name}] ⚖️ 전략적 부분 매도 실행: {symbol} {sell_qty}개 (보유량의 {sell_qty/pos_qty*100:.1f}%)")
+                                    fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if "binance" in config_key else TRADING_CONFIG["fees"]["crypto_fee_rate"]
+                                    self._execute_sell(api, portfolio, risk_manager, symbol, current_price, exit_reason, fee, save_path, quantity=sell_qty)
+                                    continue # 부분 매도 후 루프 계속 (전량 매도 아님)
 
                     if exit_reason:
                         fee = TRADING_CONFIG["fees"]["binance_fee_rate"] if "binance" in config_key else TRADING_CONFIG["fees"]["crypto_fee_rate"]
@@ -1913,7 +2099,7 @@ class AutoTradingBot:
                         target_strategy = "breakout" # 비트도 돌파 매매 사용 (안정적)
                     else:
                         target_timeframe = TRADING_CONFIG[config_key].get("timeframe", "15m")
-                        target_strategy = "breakout" # 알트코인은 무조건 Breakout
+                        target_strategy = TRADING_CONFIG[config_key].get("entry_strategy", "breakout") # 설정된 전략 사용
                     
                     # [MTF 필터] 알트코인 매매 시(15m 등), 1시간봉 EMA 50 위에서만 매수 (대세 상승장 확인)
                     if "BTC" not in symbol and target_timeframe in ["15m", "5m", "1m"]:
@@ -1932,8 +2118,13 @@ class AutoTradingBot:
                     # [Request: Rate Limit] 종목별 수집 간 0.2초 딜레이
                     time.sleep(0.2)
                     
-                    # [Request 1] 초기 데이터 수집량 상향 (200개)
-                    data = api.get_ohlcv(symbol, target_timeframe, limit=200)
+                    # [Request 1] 초기 데이터 수집량 설정
+                    # MA Trend 전략은 4시간봉 리샘플링을 위해 많은 데이터(3000개) 필요
+                    limit_count = 200
+                    if target_strategy == "ma_trend":
+                        limit_count = 3000
+                        
+                    data = api.get_ohlcv(symbol, target_timeframe, limit=limit_count)
                     
                     # [Request: Data Integrity] 200개 요청했으나 100개 이상이면 전략 실행 허용
                     min_required = 100
@@ -1946,7 +2137,7 @@ class AutoTradingBot:
                         logger.info(f"[{exchange_name}] [{symbol}] 웜업 데이터 로드 완료: {len(data)}개 (목표: 200)")
                     
                     # 신호 생성
-                    signal = self.crypto_strategy.generate_signal(
+                    signal = self.strategies[config_key].generate_signal(
                         symbol, 
                         data, 
                         portfolio.current_capital,
@@ -1955,6 +2146,16 @@ class AutoTradingBot:
                     # [수정] ATR NoneType 방지 및 0.0 처리 (None 비교 에러 방지)
                     atr = signal.atr_value if signal and signal.atr_value is not None else 0.0
                     
+                    # [Fix] 전략에서 ATR을 반환하지 않았더라도 데이터가 충분하면 직접 계산 (AgileStrategy 등 대응)
+                    if atr <= 0 and len(data) >= 20:
+                        try:
+                            atr_indicator = AverageTrueRange(data['high'], data['low'], data['close'], window=14)
+                            atr = atr_indicator.average_true_range().iloc[-1]
+                            if signal:
+                                signal.atr_value = atr # 신호 객체에도 업데이트
+                        except Exception:
+                            pass # 계산 실패 시 0.0 유지 (아래 로직에서 기본값 적용)
+
                     # [로그 가시성] 진입 보류 시 이유 출력
                     if signal and signal.action == "HOLD":
                         logger.debug(f"[{exchange_name}] 🚫 {symbol} 진입 보류: {signal.reason}")
@@ -2142,7 +2343,7 @@ class AutoTradingBot:
                                     actual_buy_amount = buy_amount * (1 - fee_rate)
                                     quantity = actual_buy_amount / current_price
                                     
-                                    portfolio.add_position(symbol, quantity, current_price, fee_rate=fee_rate)
+                                    portfolio.add_position(symbol, quantity, current_price, fee_rate=fee_rate, atr_value=atr)
                                     
                                     # 피라미딩 상태 업데이트
                                     if config_key == "crypto":
@@ -2242,9 +2443,13 @@ class AutoTradingBot:
         logger.info("=" * 60)
         logger.info("포트폴리오 상태")
         logger.info("=" * 60)
+
+        from config.settings import API_CONFIG
         
         # 한국주식 포트폴리오
-        if self.stock_portfolio.positions:
+        # API가 활성화되어 있고, 포지션이 있거나 초기 자본금이 설정된 경우에만 출력
+        if (API_CONFIG.get("shinhan") or API_CONFIG.get("kiwoom") or API_CONFIG.get("daishin")) and \
+           (self.stock_portfolio.positions or self.stock_portfolio.initial_capital > 0):
             logger.info("[한국주식]")
             current_prices = {}
             stock_apis = [api for api in [self.shinhan_api, self.kiwoom_api, self.daishin_api] if api]
@@ -2273,7 +2478,8 @@ class AutoTradingBot:
                             f"평가손익 {pnl:,.0f}원 ({pnl_pct:+.2f}%) | 보유 {quantity}주")
         
         # 암호화폐 포트폴리오
-        if self.crypto_portfolio.positions:
+        if API_CONFIG.get("upbit") and \
+           (self.crypto_portfolio.positions or self.crypto_portfolio.initial_capital > 0):
             logger.info("[암호화폐]")
             current_prices = {}
             if self.crypto_api:
@@ -2297,7 +2503,8 @@ class AutoTradingBot:
                             f"평가손익 {pnl:,.0f}원 ({pnl_pct:+.2f}%) | 보유 {quantity:.4f}")
 
         # 바이낸스 현물
-        if getattr(self, 'binance_spot_portfolio', None) and self.binance_spot_portfolio.positions:
+        if API_CONFIG.get("binance_spot") and getattr(self, 'binance_spot_portfolio', None) and \
+           (self.binance_spot_portfolio.positions or self.binance_spot_portfolio.initial_capital > 0):
             logger.info("[바이낸스 현물]")
             current_prices = {}
             if getattr(self, 'binance_spot_api', None):
@@ -2321,7 +2528,8 @@ class AutoTradingBot:
                             f"평가손익 {pnl:,.2f} ({pnl_pct:+.2f}%) | 보유 {quantity:.4f}")
 
         # 바이낸스 선물
-        if getattr(self, 'binance_futures_portfolio', None) and self.binance_futures_portfolio.positions:
+        if API_CONFIG.get("binance_futures") and getattr(self, 'binance_futures_portfolio', None) and \
+           (self.binance_futures_portfolio.positions or self.binance_futures_portfolio.initial_capital > 0):
             logger.info("[바이낸스 선물]")
             current_prices = {}
             if getattr(self, 'binance_futures_api', None):
@@ -2452,6 +2660,12 @@ class AutoTradingBot:
         # 전략 추천 실행
         self.recommend_strategy()
         
+        # [New] 초기 기동 시 전체 백테스트 수행 및 설정 반영 (블로킹)
+        self.run_periodic_backtest(wait=True)
+        
+        # [New] 시작 시 전략 파라미터 최적화 즉시 실행 (K, TP, SL)
+        self.optimize_strategy_params()
+        
         # 모델 학습
         self.train_ml_model()
         
@@ -2473,6 +2687,14 @@ class AutoTradingBot:
             minute=5
         )
         
+        # [New] 매일 아침 9시에 전체 전략 백테스트 및 최적화 실행 (별도 프로세스)
+        self.scheduler.add_job(
+            self.run_periodic_backtest,
+            'cron',
+            hour=9,
+            minute=0
+        )
+
         self.scheduler.add_job(
             self.monitor_and_trade,
             'interval',
@@ -2504,6 +2726,14 @@ class AutoTradingBot:
                 hour=h,
                 minute=0
             )
+        
+        # [New] 매일 아침 8시에 USDT 잔고 간편 보고
+        self.scheduler.add_job(
+            self.report_usdt_balance,
+            'cron',
+            hour=8,
+            minute=0
+        )
         
         # 1분마다 지갑 동기화 (외부 매매 내역 반영)
         self.scheduler.add_job(
@@ -2583,6 +2813,31 @@ class AutoTradingBot:
                 self.report_manager.report_portfolio_status(self.binance_spot_portfolio, "BINANCE SPOT", api=self.binance_spot_api)
             if getattr(self, 'binance_futures_portfolio', None):
                 self.report_manager.report_portfolio_status(self.binance_futures_portfolio, "BINANCE FUTURES", api=self.binance_futures_api)
+
+    def report_usdt_balance(self):
+        """매일 아침 USDT 잔고 간편 보고"""
+        if not self.report_manager: return
+        
+        # 최신 잔고 동기화
+        self.sync_wallet()
+        
+        msg = "🌅 *[일일 USDT 잔고 보고]*\n\n"
+        has_data = False
+        
+        # 바이낸스 현물
+        if getattr(self, 'binance_spot_portfolio', None):
+            usdt = self.binance_spot_portfolio.current_capital
+            msg += f"🟡 *Binance Spot*: `{usdt:,.2f} USDT`\n"
+            has_data = True
+            
+        # 바이낸스 선물
+        if getattr(self, 'binance_futures_portfolio', None):
+            usdt = self.binance_futures_portfolio.current_capital
+            msg += f"🔴 *Binance Futures*: `{usdt:,.2f} USDT`\n"
+            has_data = True
+            
+        if has_data:
+            self.report_manager.send_telegram_message(msg)
 
     def stop(self):
         """봇 종료"""

@@ -30,7 +30,7 @@ class TradingStrategy:
     def __init__(self, lookback_window: int = 60):
         self.lookback_window = lookback_window
     
-    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None) -> Optional[Signal]:
+    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None, **kwargs) -> Optional[Signal]:
         """거래 신호 생성"""
         raise NotImplementedError
 
@@ -44,7 +44,7 @@ class MLStrategy(TradingStrategy):
         self.ml_predictor = ml_predictor
         self.confidence_threshold = confidence_threshold
     
-    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None) -> Optional[Signal]:
+    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None, **kwargs) -> Optional[Signal]:
         """
         머신러닝 모델의 예측을 기반으로 신호 생성
         
@@ -209,9 +209,19 @@ class TechnicalStrategy(TradingStrategy):
         3. 필터: 현재가가 EMA 50 위에 있을 때 (중기 상승 추세)
         """
         try:
+            # [Fix] 리샘플링을 위해 DatetimeIndex 확인 및 설정 (백테스팅 호환성)
+            df_daily_source = data
+            if not isinstance(data.index, pd.DatetimeIndex):
+                if 'timestamp' in data.columns:
+                    df_daily_source = data.set_index('timestamp')
+                    if not isinstance(df_daily_source.index, pd.DatetimeIndex):
+                        df_daily_source.index = pd.to_datetime(df_daily_source.index)
+                else:
+                    return False, 0.0, "일봉 변환 불가(No Timestamp)"
+
             # 1. 일봉 데이터로 리샘플링 (Upbit 기준 09:00 KST = 00:00 UTC)
             # ccxt 데이터는 UTC 기준이므로 '1D' 리샘플링 시 00:00 UTC 기준이 됨
-            df_daily = data.resample('1D').agg({
+            df_daily = df_daily_source.resample('1D').agg({
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
             }).dropna()
             
@@ -224,7 +234,30 @@ class TechnicalStrategy(TradingStrategy):
             
             # 2. Range 및 돌파 기준 가격 계산
             prev_range = prev_day['high'] - prev_day['low']
+            
+            # [New] K값 동적 계산 (최근 20일 노이즈 비율 평균)
+            # 기본값 로드
             k = TRADING_CONFIG["crypto"].get("k_value", 0.5)
+            
+            # 데이터가 충분하면(20일 이상) 동적 K 계산
+            if len(df_daily) >= 21:
+                try:
+                    # 노이즈 = 1 - abs(시가 - 종가) / (고가 - 저가)
+                    daily_range = df_daily['high'] - df_daily['low']
+                    daily_range = daily_range.replace(0, 1e-9) # 0 나누기 방지
+                    
+                    noise = 1 - abs(df_daily['open'] - df_daily['close']) / daily_range
+                    
+                    # 전일 기준 최근 20일 평균 노이즈
+                    noise_ma = noise.rolling(window=20).mean()
+                    dynamic_k = noise_ma.iloc[-2]
+                    
+                    if not pd.isna(dynamic_k):
+                        # K값 범위 제한 (0.3 ~ 0.9)
+                        k = max(0.3, min(dynamic_k, 0.9))
+                except Exception:
+                    pass # 계산 실패 시 기본값 유지
+
             breakout_price = today['open'] + (prev_range * k)
             
             current_price = data['close'].iloc[-1]
@@ -234,7 +267,7 @@ class TechnicalStrategy(TradingStrategy):
             is_uptrend = current_price > ema50
             
             if current_price > breakout_price and is_uptrend:
-                return True, 0.9, f"변동성 돌파 (현재가 {current_price:,.0f} > {breakout_price:,.0f}, K={k})"
+                return True, 0.9, f"변동성 돌파 (현재가 {current_price:,.0f} > {breakout_price:,.0f}, K={k:.2f})"
                 
             return False, 0.0, ""
             
@@ -333,7 +366,7 @@ class TechnicalStrategy(TradingStrategy):
             
         return current_volume / avg_volume
 
-    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None) -> Optional[Signal]:
+    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None, **kwargs) -> Optional[Signal]:
         """기술적 지표 기반 신호 생성 (RSI, MACD, 볼린저밴드, OBV, 추세선)"""
         # [Request 1] 최소 데이터 개수 검증
         if len(data) < 20:
@@ -514,8 +547,18 @@ class TechnicalStrategy(TradingStrategy):
                 try:
                     # 데이터가 충분할 때만 리샘플링 수행
                     if len(data) >= 60:
+                        # [Fix] 리샘플링용 데이터 준비 (인덱스 보정)
+                        df_1h_source = data
+                        if not isinstance(data.index, pd.DatetimeIndex):
+                            if 'timestamp' in data.columns:
+                                df_1h_source = data.set_index('timestamp')
+                                if not isinstance(df_1h_source.index, pd.DatetimeIndex):
+                                    df_1h_source.index = pd.to_datetime(df_1h_source.index)
+                            else:
+                                raise ValueError("No timestamp for resampling")
+
                         # 1시간봉으로 리샘플링 (1h)
-                        df_1h = data.resample('1h').agg({
+                        df_1h = df_1h_source.resample('1h').agg({
                             'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
                         }).dropna()
                         

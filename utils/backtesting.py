@@ -12,13 +12,14 @@ from trading.strategy import MLStrategy, TechnicalStrategy, Signal
 class WalkForwardAnalyzer:
     """전진분석(Walk-Forward Analysis) 백테스팅"""
     
-    def __init__(self, data: pd.DataFrame, train_period: int = 252, 
+    def __init__(self, data: pd.DataFrame, symbol: str = "TEST_SYM", train_period: int = 252, 
                  test_period: int = 63, slippage: float = 0.0005, fee: float = 0.0005,
                  stop_loss: float = None, take_profit: float = None, 
                  trailing_stop: float = None, confidence_threshold: float = 0.5):
         """
         Args:
             data: OHLCV 데이터
+            symbol: 종목 코드 (로깅용)
             train_period: 학습 기간 (거래일)
             test_period: 테스트 기간 (거래일)
             slippage: 슬리피지 (기본 0.05%) - 체결 오차 반영
@@ -29,6 +30,7 @@ class WalkForwardAnalyzer:
             confidence_threshold: 전략 신뢰도 임계값 (기본 0.5)
         """
         self.data = data
+        self.symbol = symbol
         self.train_period = train_period
         self.test_period = test_period
         self.slippage = slippage
@@ -39,10 +41,10 @@ class WalkForwardAnalyzer:
         self.confidence_threshold = confidence_threshold
         self.results = []
     
-    def run(self, strategy_type: str = "technical", model_type: str = "lstm") -> pd.DataFrame:
+    def run(self, strategy_type: str = "technical", model_type: str = "lstm", lookback_window: int = 400) -> pd.DataFrame:
         """전진분석 실행"""
         step_size = self.test_period
-        lookback = 400  # [수정] MTF 분석을 위해 룩백 기간 상향 (60 -> 400)
+        lookback = lookback_window
         
         # 마지막 구간까지 포함하기 위해 range 범위 수정 (+1)
         for i in range(0, len(self.data) - self.train_period - self.test_period + 1, step_size):
@@ -113,7 +115,7 @@ class WalkForwardAnalyzer:
             current_price = test_data['close'].iloc[i]
             current_high = test_data['high'].iloc[i]
             current_low = test_data['low'].iloc[i]
-            symbol = "TEST_SYM"
+            symbol = self.symbol
             
             # 1. Long 보유 중일 때 SL/TP 체크
             if position == 1:
@@ -192,6 +194,21 @@ class WalkForwardAnalyzer:
                     current_capital += pnl
                     trades.append(pnl)
                     continue
+                
+                # [Fix] Short Take Profit (익절)
+                elif self.take_profit and current_low <= entry_price * (1 - self.take_profit):
+                    position = 0
+                    exit_price = entry_price * (1 - self.take_profit) * (1 + self.slippage)
+                    exit_value = (entry_price - exit_price) * quantity
+                    fee_cost = (entry_price * quantity + exit_price * quantity) * self.fee
+                    pnl = exit_value - fee_cost
+                    current_capital += pnl
+                    trades.append(pnl)
+                    continue
+
+                # [Fix] Short Trailing Stop (트레일링 스탑) - 최저가 추적 필요 (여기선 생략하거나 간단히 구현)
+                # Short는 가격이 내려갈수록 이익이므로, 최저가를 갱신하다가 반등하면 청산
+                # (구현 복잡도를 위해 여기서는 생략하고 TP/SL만 적용)
 
             # 전략에서 신호 생성
             signal = strategy.generate_signal(symbol, recent_data, current_capital=current_capital)
@@ -263,6 +280,23 @@ class WalkForwardAnalyzer:
                     # 비용 계산 (Short는 증거금 필요)
                     entry_cost = (entry_price * quantity) * self.fee # 진입 수수료만 기록
         
+        # [Fix] 백테스트 종료 시 잔여 포지션 강제 청산 (Mark-to-Market)
+        if position != 0:
+            last_price = test_data['close'].iloc[-1]
+            if position == 1:
+                exit_price = last_price * (1 - self.slippage)
+                exit_value = (exit_price * quantity) * (1 - self.fee)
+                pnl = exit_value - entry_cost
+                current_capital += pnl
+                trades.append(pnl)
+            elif position == -1:
+                exit_price = last_price * (1 + self.slippage)
+                exit_value = (entry_price - exit_price) * quantity
+                fee_cost = (entry_price * quantity + exit_price * quantity) * self.fee
+                pnl = exit_value - fee_cost
+                current_capital += pnl
+                trades.append(pnl)
+
         # 통계 계산
         if not trades:
             return {

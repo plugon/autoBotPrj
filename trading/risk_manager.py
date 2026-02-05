@@ -32,8 +32,8 @@ class RiskManager:
                 # ATR 기반 2N 손절가 자동 계산
                 stop_loss_price = entry_price - (atr_value * self.atr_multiplier)
             else:
-                logger.warning(f"⚠️ {symbol} ATR 정보 없음. 비상 손절(-10%)을 적용합니다.")
-                stop_loss_price = entry_price * 0.9
+                logger.warning(f"⚠️ {symbol} ATR 정보 없음. 비상 손절(-5%)을 적용합니다.")
+                stop_loss_price = entry_price * 0.95
         else:
             stop_loss_price = custom_stop_loss
 
@@ -55,7 +55,7 @@ class RiskManager:
 
         # [New] 동적 익절 로직 (ATR 기반 가변 익절)
         if atr_value > 0 and entry_price > 0:
-            # 변동성이 크면 익절 목표 상향 (3 * ATR 기준)
+            # 변동성이 크면 익절 목표 상향 (3 * ATR 기준 - 수익 극대화)
             dynamic_pct = (atr_value * 3.0) / entry_price
             
             # 최소 0.5% ~ 최대 20% 범위 내에서 조정

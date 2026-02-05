@@ -42,7 +42,7 @@ class HeikinAshiStrategy(TradingStrategy):
             
             return ha_df
 
-    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None) -> Optional[Signal]:
+    def generate_signal(self, symbol: str, data: pd.DataFrame, current_capital: float = 0.0, strategy_override: str = None, **kwargs) -> Optional[Signal]:
         """
         하이킨아시 기반 매수/매도 신호 생성 (완화된 조건)
         

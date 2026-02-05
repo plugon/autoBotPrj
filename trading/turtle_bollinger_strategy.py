@@ -31,7 +31,7 @@ class TurtleBollingerStrategy(TradingStrategy):
 
     def generate_signal(self, symbol: str, data: pd.DataFrame, 
                        current_capital: float = 0.0, 
-                       strategy_override: str = None) -> Optional[Signal]:
+                       strategy_override: str = None, **kwargs) -> Optional[Signal]:
         """매수/매도 신호 생성"""
         
         # [Request 2] 안정적인 지표 계산을 위한 최소 데이터 확인 (EMA50, BB20 고려)

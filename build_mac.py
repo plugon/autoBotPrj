@@ -77,15 +77,25 @@ def build_mac():
     print("\n📊 3/3: Analyze Performance 빌드 시작")
     PyInstaller.__main__.run(['analyze_performance.py', '--name=AnalyzePerformance', '--onefile', '--clean', '--distpath=dist_mac'] + icon_args)
 
+    # 4. Backtester 빌드 (추가)
+    print("\n🧪 4/4: Backtester 빌드 시작")
+    backtest_args = ['run_backtest_all.py', '--name=Backtester', '--onefile', '--clean', '--distpath=dist_mac'] + icon_args
+    for hi in ['tensorflow', 'onnxruntime', 'tf2onnx', 'sklearn.utils._typedefs', 'websocket']:
+        backtest_args.append(f'--hidden-import={hi}')
+    for src, dest in tf_datas: backtest_args.append(f'--add-data={src}{os.pathsep}{dest}')
+    PyInstaller.__main__.run(backtest_args)
+
     # 마무리 작업
     for folder in ['data', 'logs', 'models', 'config']: os.makedirs(os.path.join("dist_mac", folder), exist_ok=True)
     if os.path.exists(".env"): shutil.copy(".env", "dist_mac/.env")
+    if os.path.exists(".env_secret"): shutil.copy(".env_secret", "dist_mac/.env_secret") # [New] 시크릿 파일 복사
     
     # 실행 권한 부여 (Mac/Linux)
     try:
         subprocess.check_call(['chmod', '+x', 'dist_mac/TradingBot'])
         subprocess.check_call(['chmod', '+x', 'dist_mac/Dashboard'])
         subprocess.check_call(['chmod', '+x', 'dist_mac/AnalyzePerformance'])
+        subprocess.check_call(['chmod', '+x', 'dist_mac/Backtester'])
     except Exception as e:
         print(f"⚠️ 실행 권한 설정 실패: {e}")
 

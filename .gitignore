@@ -1,5 +1,6 @@
 # 보안 파일 (절대 올리지 말 것)
 .env
+.env_secret
 
 # Python 및 빌드 관련
 __pycache__/
