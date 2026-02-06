@@ -11,3 +11,4 @@ psutil
 matplotlib
 streamlit
 websocket-client
+apscheduler

@@ -1552,13 +1552,14 @@ class AutoTradingBot:
             cash_free = balance.get("free", {}).get(currency, 0)
             portfolio.current_capital = cash_free
             
-            # [New] 초기 자본금 설정 불일치 경고 (수익률 왜곡 방지)
+            # [New] 초기 자본금 설정 불일치 자동 보정 (수익률 왜곡 방지)
             if not portfolio.positions and portfolio.initial_capital > 0:
                 diff_pct = (portfolio.current_capital - portfolio.initial_capital) / portfolio.initial_capital
-                if diff_pct < -0.5: # 실제 잔고가 설정보다 50% 이상 적을 때
-                    logger.warning(f"⚠️ [CONFIG] {currency} 초기 자본금 설정({portfolio.initial_capital:,.2f})과 실제 잔고({portfolio.current_capital:,.2f}) 괴리가 큽니다.")
-                    logger.warning(f"   -> 이로 인해 수익률이 {diff_pct*100:.2f}%로 잘못 표시되고 있습니다.")
-                    logger.warning(f"   -> 해결책: .env의 INITIAL_CAPITAL을 실제 잔고에 맞게 수정하거나, data/*.json 파일을 삭제하여 리셋하세요.")
+                # 실제 잔고가 설정보다 30% 이상 차이나면 (증가/감소 모두)
+                if abs(diff_pct) > 0.3:
+                    logger.warning(f"⚠️ [CONFIG] {currency} 초기 자본금({portfolio.initial_capital:,.2f})과 실제 잔고({portfolio.current_capital:,.2f})의 괴리가 큽니다.")
+                    logger.warning(f"   -> 수익률 왜곡 방지를 위해 초기 자본금을 실제 잔고로 자동 보정합니다.")
+                    portfolio.initial_capital = portfolio.current_capital
             
             api_positions = api.get_positions()
             api_pos_map = {p['symbol']: p for p in api_positions}
@@ -2746,6 +2747,13 @@ class AutoTradingBot:
             minute=0
         )
         
+        # [New] 수익금 자동 이체 (1시간마다 체크)
+        self.scheduler.add_job(
+            self.secure_profits,
+            'interval',
+            hours=1
+        )
+        
         # 1분마다 지갑 동기화 (외부 매매 내역 반영)
         self.scheduler.add_job(
             self.sync_wallet,
@@ -2849,6 +2857,43 @@ class AutoTradingBot:
             
         if has_data:
             self.report_manager.send_telegram_message(msg)
+
+    def secure_profits(self):
+        """수익금 자동 이체 (Binance Futures -> Spot)"""
+        # 바이낸스 선물만 지원 (가장 일반적인 니즈)
+        if not getattr(self, 'binance_futures_api', None):
+            return
+
+        try:
+            # 최신 잔고 확인 (가용 USDT)
+            balance = self.binance_futures_api.get_balance()
+            current_usdt = float(balance.get("free", {}).get("USDT", 0))
+            
+            portfolio = self.binance_futures_portfolio
+            initial = portfolio.initial_capital
+            
+            if initial <= 0: return
+
+            # 순수익 계산 (현재 가용 USDT - 초기 자본)
+            profit = current_usdt - initial
+            roi = profit / initial
+            
+            # [New] .env에서 이체 기준 수익률 로드 (기본값 10%)
+            transfer_threshold = float(os.getenv("PROFIT_TRANSFER_THRESHOLD", 0.10))
+            
+            # 설정된 수익률 이상 수익 & 최소 5 USDT 이상일 때 이체
+            if roi >= transfer_threshold and profit >= 5:
+                logger.info(f"🎉 [PROFIT] 바이낸스 선물 수익률 {roi*100:.2f}% 달성! 수익금 이체 시도...")
+                
+                # 이체 실행
+                if self.binance_futures_api.transfer_futures_to_spot(profit):
+                    self._send_telegram_alert(f"💰 *[수익 확보]*\n목표 수익률({roi*100:.1f}%) 달성!\n수익금 `{profit:.2f} USDT`를 현물 지갑으로 안전하게 이동했습니다.")
+                    
+                    # 포트폴리오 상태 업데이트 (중복 이체 방지)
+                    portfolio.current_capital -= profit
+                    portfolio.save_state("data/binance_futures_portfolio.json")
+        except Exception as e:
+            logger.error(f"수익금 이체 중 오류: {e}")
 
     def _check_system_time(self):
         """시스템 시간 유효성 검사"""

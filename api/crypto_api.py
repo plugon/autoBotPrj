@@ -919,6 +919,20 @@ class BinanceAPI(BaseAPI):
                 logger.error(f"Dust 변환 오류: {e}")
             return {}
 
+    def transfer_futures_to_spot(self, amount: float, asset: str = "USDT") -> bool:
+        """선물 지갑 -> 현물 지갑 이체 (수익금 확보)"""
+        if not self.is_future:
+            return False
+            
+        try:
+            # ccxt unified transfer (future -> spot)
+            self.exchange.transfer(asset, amount, 'future', 'spot')
+            logger.info(f"💰 [BINANCE] 수익금 이체 완료: {amount:.2f} {asset} (Futures -> Spot)")
+            return True
+        except Exception as e:
+            logger.error(f"❌ [BINANCE] 수익금 이체 실패: {e}")
+            return False
+
     def _ensure_market_settings(self, symbol: str):
         """[요청사항 1, 2] 격리 마진 및 레버리지 설정 (하드캡 적용)"""
         # [요청사항 4] 선물 전용 로직 보호 (현물 모드 시 실행 차단)
