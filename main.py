@@ -1552,6 +1552,14 @@ class AutoTradingBot:
             cash_free = balance.get("free", {}).get(currency, 0)
             portfolio.current_capital = cash_free
             
+            # [New] 초기 자본금 설정 불일치 경고 (수익률 왜곡 방지)
+            if not portfolio.positions and portfolio.initial_capital > 0:
+                diff_pct = (portfolio.current_capital - portfolio.initial_capital) / portfolio.initial_capital
+                if diff_pct < -0.5: # 실제 잔고가 설정보다 50% 이상 적을 때
+                    logger.warning(f"⚠️ [CONFIG] {currency} 초기 자본금 설정({portfolio.initial_capital:,.2f})과 실제 잔고({portfolio.current_capital:,.2f}) 괴리가 큽니다.")
+                    logger.warning(f"   -> 이로 인해 수익률이 {diff_pct*100:.2f}%로 잘못 표시되고 있습니다.")
+                    logger.warning(f"   -> 해결책: .env의 INITIAL_CAPITAL을 실제 잔고에 맞게 수정하거나, data/*.json 파일을 삭제하여 리셋하세요.")
+            
             api_positions = api.get_positions()
             api_pos_map = {p['symbol']: p for p in api_positions}
             
@@ -2625,6 +2633,9 @@ class AutoTradingBot:
         logger.info("자동매매 봇 시작")
         logger.info("="*60)
         
+        # [New] 시스템 시간 점검
+        self._check_system_time()
+        
         # API 초기화
         # [수정] 초기화 실패 시 종료하지 않고 재시도 (무한 루프)
         while True:
@@ -2838,6 +2849,38 @@ class AutoTradingBot:
             
         if has_data:
             self.report_manager.send_telegram_message(msg)
+
+    def _check_system_time(self):
+        """시스템 시간 유효성 검사"""
+        try:
+            # 구글 서버 시간을 기준으로 검증 (가장 정확함)
+            response = requests.head("https://www.google.com", timeout=5)
+            if 'Date' in response.headers:
+                from email.utils import parsedate_to_datetime
+                server_time = parsedate_to_datetime(response.headers['Date']).replace(tzinfo=None)
+                local_time = datetime.utcnow()
+                
+                diff_seconds = abs((server_time - local_time).total_seconds())
+                
+                # [New] 항상 시간 정보 출력 (사용자 확인용)
+                logger.info(f"🕒 [SYSTEM] 시간 동기화 점검")
+                logger.info(f"   - 내 컴퓨터(UTC): {local_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"   - 실제 시간(UTC): {server_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                if diff_seconds > 300: # 5분 이상 차이 시 경고
+                    logger.critical("="*60)
+                    logger.critical(f"🚨 [SYSTEM] 시스템 시간이 실제 시간과 크게 다릅니다! (약 {diff_seconds/60:.0f}분 차이)")
+                    logger.critical("   -> 윈도우 설정 > 시간 및 언어 > '자동으로 시간 설정'을 껐다가 켜서 동기화하세요.")
+                    logger.critical("="*60)
+                else:
+                    logger.info("✅ 시스템 시간이 정확합니다.")
+
+        except Exception as e:
+            # 네트워크 오류 등으로 확인 불가 시 연도만 체크
+            current_year = datetime.now().year
+            logger.warning(f"⚠️ [SYSTEM] 시간 서버 연결 실패 ({e}). 로컬 연도만 확인합니다: {current_year}")
+            if current_year >= 2030:
+                 logger.warning(f"⚠️ [SYSTEM] 시스템 연도가 {current_year}년으로 설정되어 있습니다. 현재 시간이 맞는지 확인하세요.")
 
     def stop(self):
         """봇 종료"""

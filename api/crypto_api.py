@@ -788,7 +788,7 @@ class BinanceAPI(BaseAPI):
                 'options': {
                     'defaultType': default_type, # .env 설정에 따라 강제
                     'adjustForTimeDifference': True, # [Request] 시간 동기화 자동 보정
-                    'recvWindow': 10000, # [Request] 네트워크 지연 허용 (10초)
+                    'recvWindow': 60000, # [Request] 네트워크 지연 허용 (60초 - 최대)
                 },
                 'timeout': 10000, # [Request] 타임아웃 10초 설정
             })
@@ -811,6 +811,14 @@ class BinanceAPI(BaseAPI):
             self.ws_app.close()
         self.exchange = None
         logger.info("바이낸스 API 연결 종료")
+
+    def sync_time(self):
+        """서버 시간 동기화 (Timestamp error 해결용)"""
+        try:
+            self.exchange.load_time_difference()
+            logger.info("✅ [BINANCE] 서버 시간 동기화 완료")
+        except Exception as e:
+            logger.error(f"시간 동기화 실패: {e}")
 
     def set_leverage(self, symbol: str, leverage: int):
         """[New] 레버리지 설정"""
@@ -949,6 +957,13 @@ class BinanceAPI(BaseAPI):
                     "used": balance.get("used", {}),
                 }
             except Exception as e:
+                # [New] 타임스탬프 에러 처리 (-1021)
+                if "-1021" in str(e):
+                    logger.warning(f"⚠️ [BINANCE] 타임스탬프 오류(-1021) 감지. 시간 동기화 후 재시도...")
+                    self.sync_time()
+                    time.sleep(0.5)
+                    continue
+
                 # 마지막 시도였다면 에러 로그 후 종료
                 if attempt == max_retries - 1:
                     logger.error(f"❌ [BINANCE] 잔액 조회 최종 실패: {e}")
@@ -1029,62 +1044,73 @@ class BinanceAPI(BaseAPI):
     
     def get_positions(self) -> List[Dict]:
         """보유 포지션 조회 (평단가 포함)"""
-        try:
-            # [요청사항 1] 현물/선물 모드에 따라 조회 방식 분기
-            is_future = self.is_future
-            
-            if is_future:
-                # [선물] fetch_positions 사용
-                raw_positions = self.exchange.fetch_positions()
-                positions = []
-                for p in raw_positions:
-                    qty = float(p['contracts'])
-                    if qty > 0:
-                        positions.append({
-                            'symbol': p['symbol'],
-                            'quantity': qty,
-                            'entry_price': float(p['entryPrice'])
-                        })
-                return positions
-            else:
-                # [현물] fetch_balance 사용 (Spot Balance)
-                balance = self.exchange.fetch_balance()
-                positions = []
-                # [Fix] ccxt의 파싱 결과(total)가 아닌, 원본 응답(info)을 사용하여 누락 방지
-                if 'info' in balance and 'balances' in balance['info']:
-                    for asset_balance in balance['info']['balances']:
-                        asset = asset_balance['asset']
-                        free = float(asset_balance['free'])
-                        locked = float(asset_balance['locked'])
-                        total_qty = free + locked
-                        
-                        # USDT와 0 수량은 제외
-                        if asset == 'USDT' or total_qty <= 0:
-                            continue
-                        
-                        symbol = f"{asset}/USDT"
-                        # USDT 페어가 존재하는지 확인 (거래 가능한 자산인지 체크)
-                        if symbol in self.exchange.markets:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # [요청사항 1] 현물/선물 모드에 따라 조회 방식 분기
+                is_future = self.is_future
+                
+                if is_future:
+                    # [선물] fetch_positions 사용
+                    raw_positions = self.exchange.fetch_positions()
+                    positions = []
+                    for p in raw_positions:
+                        qty = float(p['contracts'])
+                        if qty > 0:
                             positions.append({
-                                'symbol': symbol,
-                                'quantity': total_qty,
-                                'entry_price': 0.0 # 현물은 평단가 API 미제공
+                                'symbol': p['symbol'],
+                                'quantity': qty,
+                                'entry_price': float(p['entryPrice'])
                             })
-                else: # 'info' 필드가 없는 경우 기존 로직으로 fallback
-                    if 'total' in balance:
-                        for currency, qty in balance['total'].items():
-                            if currency == 'USDT': continue
-                            if qty > 0:
-                                symbol = f"{currency}/USDT"
+                    return positions
+                else:
+                    # [현물] fetch_balance 사용 (Spot Balance)
+                    balance = self.exchange.fetch_balance()
+                    positions = []
+                    # [Fix] ccxt의 파싱 결과(total)가 아닌, 원본 응답(info)을 사용하여 누락 방지
+                    if 'info' in balance and 'balances' in balance['info']:
+                        for asset_balance in balance['info']['balances']:
+                            asset = asset_balance['asset']
+                            free = float(asset_balance['free'])
+                            locked = float(asset_balance['locked'])
+                            total_qty = free + locked
+                            
+                            # USDT와 0 수량은 제외
+                            if asset == 'USDT' or total_qty <= 0:
+                                continue
+                            
+                            symbol = f"{asset}/USDT"
+                            # USDT 페어가 존재하는지 확인 (거래 가능한 자산인지 체크)
+                            if symbol in self.exchange.markets:
                                 positions.append({
                                     'symbol': symbol,
-                                    'quantity': float(qty),
-                                    'entry_price': 0.0
+                                    'quantity': total_qty,
+                                    'entry_price': 0.0 # 현물은 평단가 API 미제공
                                 })
-            return positions
-        except Exception as e:
-            logger.error(f"포지션 조회 오류: {e}")
-            return []
+                    else: # 'info' 필드가 없는 경우 기존 로직으로 fallback
+                        if 'total' in balance:
+                            for currency, qty in balance['total'].items():
+                                if currency == 'USDT': continue
+                                if qty > 0:
+                                    symbol = f"{currency}/USDT"
+                                    positions.append({
+                                        'symbol': symbol,
+                                        'quantity': float(qty),
+                                        'entry_price': 0.0
+                                    })
+                return positions
+            except Exception as e:
+                if "-1021" in str(e):
+                    logger.warning(f"⚠️ [BINANCE] 포지션 조회 타임스탬프 오류(-1021). 시간 동기화 후 재시도...")
+                    self.sync_time()
+                    time.sleep(0.5)
+                    continue
+                
+                if attempt == max_retries - 1:
+                    logger.error(f"포지션 조회 오류: {e}")
+                    return []
+                time.sleep(0.5)
+        return []
 
     def buy(self, symbol: str, quantity: float, price: Optional[float] = None, leverage: int = 1, **kwargs) -> Dict:
         """매수 주문 (재시도 및 공격적 지정가 포함)"""
@@ -1556,7 +1582,10 @@ class BinanceAPI(BaseAPI):
                 self.ws_app.run_forever(ping_interval=60, ping_timeout=10)
                 
             except Exception as e:
-                logger.error(f"❌ [BINANCE] WebSocket 오류: {e}")
+                if "certificate verify failed" in str(e):
+                    logger.error(f"❌ [BINANCE] SSL 인증서 오류: 시스템 시간이 정확한지 확인하세요! ({e})")
+                else:
+                    logger.error(f"❌ [BINANCE] WebSocket 오류: {e}")
                 self._notify_error(f"WebSocket 런타임 오류: {e}")
             
             # [Fix] run_forever()가 종료된 후, 의도된 종료가 아니면 재연결 시도
