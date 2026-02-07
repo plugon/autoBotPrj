@@ -2168,7 +2168,8 @@ class AutoTradingBot:
                             if not df_1h.empty and len(df_1h) >= 50:
                                 ema50_1h = df_1h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
                                 if current_price < ema50_1h * 0.95:
-                                    logger.debug(f"🚫 {symbol} 1시간봉 EMA50의 95%({ema50_1h*0.95:,.0f}) 아래(하락세) -> 매수 스킵")
+                                    # [Debug] 바이낸스 매매 안됨 원인 파악용 로그 레벨 상향 (debug -> info)
+                                    logger.info(f"[{exchange_name}] 🚫 {symbol} MTF 필터 차단: 현재가({current_price}) < 1시간봉 EMA50*0.95({ema50_1h*0.95:.2f})")
                                     continue
                         except Exception as e:
                             logger.warning(f"MTF 필터 체크 중 오류: {e}")
@@ -2188,7 +2189,7 @@ class AutoTradingBot:
                     # [Request: Data Integrity] 200개 요청했으나 100개 이상이면 전략 실행 허용
                     min_required = 100
                     if len(data) < min_required:
-                        logger.info(f"[{exchange_name}] [SAFE_WAIT] {symbol}: 데이터 부족/타임아웃으로 매매 대기 (수신: {len(data)}개 / 최소: {min_required}개)")
+                        logger.warning(f"[{exchange_name}] ⚠️ [DATA_SKIP] {symbol}: 데이터 부족으로 매매 스킵 (수신: {len(data)}개 < 최소: {min_required}개)")
                         continue
                     
                     # [Request 3] 웜업 로직 동기화 - 데이터 로드 확인 로그
@@ -2277,7 +2278,9 @@ class AutoTradingBot:
                         # 매수 금액 계산 (설정값 기반)
                         # 최소 주문 금액 보정 (업비트 최소 5,000원)
                         # 매도 시 수수료 및 가격 하락을 고려하여 6,000원 이상으로 설정 (안전마진 확보)
-                        min_order_amount = TRADING_CONFIG[config_key].get("min_order_amount", 5000)
+                        # [Fix] 바이낸스인 경우 기본값을 10 USDT로 설정 (기존 5000은 KRW 기준이라 너무 작음)
+                        default_min = 5000 if "KRW" in symbol else 10.0
+                        min_order_amount = TRADING_CONFIG[config_key].get("min_order_amount", default_min)
                         safe_min_amount = min_order_amount * 1.1 # 10% 여유
                         
                         if buy_amount < safe_min_amount:
@@ -2311,7 +2314,7 @@ class AutoTradingBot:
 
                             # 1. 잔액 체크
                             if available_cash < buy_amount:
-                                logger.info(f"[{exchange_name}] 매수 대기: 잔액 부족 ({symbol}, 가용: {available_cash:,.0f}, 필요: {buy_amount:,.0f})")
+                                logger.warning(f"[{exchange_name}] ⚠️ 매수 실패: 잔액 부족 ({symbol}, 가용: {available_cash:.2f}, 필요: {buy_amount:.2f}, 최소주문: {min_order_amount})")
                                 
                                 # [New] 예수금 부족 시 전체 미체결 매수 주문 취소하여 현금 확보
                                 logger.info(f"[{exchange_name}] 💰 가용 현금 확보를 위해 타 종목 미체결 매수 주문 취소 시도...")
