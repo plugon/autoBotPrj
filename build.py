@@ -11,12 +11,14 @@ def check_and_setup_venv():
     python_exe = os.path.join(venv_dir, "Scripts", "python.exe") if sys.platform == "win32" else os.path.join(venv_dir, "bin", "python")
 
     if not os.path.exists(python_exe):
-        print(f"🔨 가상환경 생성 및 패키지 설치 중...")
+        print(f"🔨 가상환경 생성 중...")
         subprocess.check_call([sys.executable, "-m", "venv", "venv"])
-        required = ["pip", "setuptools", "wheel", "pyinstaller", "ccxt", "pyupbit", "python-dotenv", 
-                    "pandas", "numpy", "tensorflow", "tf2onnx", "onnxruntime", "scikit-learn", 
-                    "psutil", "matplotlib", "streamlit", "websocket-client"]
-        subprocess.check_call([python_exe, "-m", "pip", "install", "--upgrade"] + required)
+
+    print(f"📦 패키지 설치 및 업데이트 확인 중...")
+    required = ["pip", "setuptools", "wheel", "pyinstaller", "ccxt", "pyupbit", "python-dotenv", 
+                "pandas", "numpy", "tensorflow", "tf2onnx", "onnxruntime", "scikit-learn", 
+                "psutil", "matplotlib", "streamlit", "websocket-client", "apscheduler", "ta", "certifi"]
+    subprocess.check_call([python_exe, "-m", "pip", "install", "--upgrade"] + required)
 
     # [Fix] 스크립트 절대 경로 사용 및 인터럽트 예외 처리 (Traceback 방지)
     script_path = os.path.abspath(sys.argv[0])
@@ -48,7 +50,7 @@ def build_exe():
     print("\n🤖 1/3: Trading Bot 빌드 시작")
     tf_datas = collect_data_files('tensorflow')
     main_args = ['main.py', '--name=TradingBot', '--onefile', '--clean'] + icon_args
-    for hi in ['tensorflow', 'onnxruntime', 'tf2onnx', 'sklearn.utils._typedefs', 'websocket']:
+    for hi in ['tensorflow', 'onnxruntime', 'tf2onnx', 'sklearn.utils._typedefs', 'websocket', 'apscheduler', 'ta', 'certifi']:
         main_args.append(f'--hidden-import={hi}')
     for src, dest in tf_datas:
         main_args.append(f'--add-data={src}{os.pathsep}{dest}')

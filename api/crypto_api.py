@@ -7,7 +7,7 @@ import json
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Optional
 from .base_api import BaseAPI
-from config.settings import MONITORING_CONFIG, TRADING_CONFIG
+from config.settings import MONITORING_CONFIG, TRADING_CONFIG, BINANCE_TESTNET
 
 try:
     import websocket
@@ -792,6 +792,11 @@ class BinanceAPI(BaseAPI):
                 },
                 'timeout': 10000, # [Request] 타임아웃 10초 설정
             })
+            
+            # [New] 테스트넷 모드 설정
+            if BINANCE_TESTNET:
+                self.exchange.set_sandbox_mode(True)
+                logger.info("🧪 [BINANCE] Testnet 모드 활성화 (Sandbox Mode)")
             
             # [New] 연결 및 권한 검증 (시장 데이터 로드 + 잔액 조회로 키 유효성 테스트)
             self.exchange.load_markets() 

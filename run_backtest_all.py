@@ -389,15 +389,23 @@ def main():
             report_lines.append(f"   └ 설정: TP {best['TP']*100:.1f}% / SL {best['SL']*100:.1f}%")
 
         if env_updates:
-            print("\n🔄 .env 파일 업데이트를 진행합니다...")
-            update_env_file(env_updates)
-            print("✅ 업데이트 완료! 봇을 재시작하면 적용됩니다.")
+            # [New] 환경변수로 업데이트 여부 제어 (기본값: True)
+            auto_update = os.getenv("AUTO_UPDATE_ENV", "true").lower() in ["true", "1", "yes", "on"]
+
+            if auto_update:
+                print("\n🔄 .env 파일 업데이트를 진행합니다...")
+                update_env_file(env_updates)
+                print("✅ 업데이트 완료! 봇을 재시작하면 적용됩니다.")
+            else:
+                print("\n🛑 [AUTO_UPDATE_ENV=False] .env 파일 업데이트를 건너뜁니다.")
+
             for k, v in env_updates.items():
                 print(f"   👉 {k}={v}")
             
             # 텔레그램 전송
             if report_lines:
-                msg = "🧪 *[전략 최적화 완료]*\n새로운 시장 상황에 맞춰 설정이 갱신되었습니다.\n\n" + "\n".join(report_lines)
+                status_msg = "설정이 갱신되었습니다." if auto_update else "설정 업데이트를 건너뛰었습니다."
+                msg = f"🧪 *[전략 최적화 결과]*\n새로운 시장 상황에 맞춰 {status_msg}\n\n" + "\n".join(report_lines)
                 send_telegram_report(msg)
         else:
             print("\nℹ️ 업데이트할 최적 전략이 없습니다.")

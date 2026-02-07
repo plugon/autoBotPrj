@@ -5,10 +5,19 @@
 """
 
 import logging
+import logging.handlers
 import time
 import os
 import sys
 import subprocess
+
+# [Fix] SSL 인증서 오류 해결 (MacOS/Proxy 환경 대응)
+import ssl
+try:
+    import certifi
+    os.environ['SSL_CERT_FILE'] = certifi.where()
+except ImportError:
+    pass
 
 # [Fix] TensorFlow 로그 노이즈 제거 (oneDNN 최적화 메시지 및 INFO 로그 숨김)
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -26,8 +35,15 @@ import joblib
 import warnings
 import concurrent.futures
 from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
-from ta.volatility import AverageTrueRange
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except ImportError:
+    sys.exit("CRITICAL: 'apscheduler' module not found. Please install it using 'pip install apscheduler'.")
+
+try:
+    from ta.volatility import AverageTrueRange
+except ImportError:
+    sys.exit("CRITICAL: 'ta' module not found. Please install it using 'pip install ta'.")
 
 from config.settings import TRADING_CONFIG, ML_CONFIG, MONITORING_CONFIG, VOLUME_CONFIG
 from api.shinhan_api import ShinhanAPI
@@ -52,7 +68,32 @@ from utils.logger import setup_logger
 # .env에서 로그 레벨 읽기 (기본값: INFO)
 log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
-logger = setup_logger("trading_bot", log_level)
+
+# [Modified] 날짜별 로그 회전을 위해 직접 설정 (TimedRotatingFileHandler 사용)
+logger = logging.getLogger("trading_bot")
+logger.setLevel(log_level)
+
+# 기존 핸들러 정리
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# 1. 콘솔 핸들러
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+# 2. 파일 핸들러 (날짜별 회전: 매일 자정)
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+log_file = os.path.join('logs', 'trading_bot.log')
+file_handler = logging.handlers.TimedRotatingFileHandler(
+    log_file, when='midnight', interval=1, backupCount=30, encoding='utf-8'
+)
+file_handler.suffix = "%Y%m%d"
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 # 라이브러리 로그 노이즈 제거 (DEBUG 모드 시 너무 많은 로그 방지)
 logging.getLogger('ccxt').setLevel(logging.WARNING)
@@ -957,6 +998,15 @@ class AutoTradingBot:
 
     def run_periodic_backtest(self, wait: bool = False):
         """정기 백테스트 및 설정 최적화 실행 (별도 프로세스)"""
+        # [New] 백테스트 활성화 여부 확인
+        from config.settings import ENABLE_BACKTEST
+        if not ENABLE_BACKTEST:
+            if wait:
+                logger.info("⏩ [CONFIG] 초기 백테스트 실행을 건너뜁니다. (ENABLE_BACKTEST=False)")
+            else:
+                logger.info("⏩ [CONFIG] 정기 백테스트 실행을 건너뜁니다. (ENABLE_BACKTEST=False)")
+            return
+
         logger.info("🧪 [Scheduler] 정기 백테스트 및 최적화 작업 시작...")
         try:
             # 스크립트 경로 (main.py와 같은 폴더에 있다고 가정)

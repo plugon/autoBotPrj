@@ -68,8 +68,16 @@ DAISHIN_ACCOUNT = os.getenv("DAISHIN_ACCOUNT", "your_account_number")
 
 UPBIT_API_KEY = os.getenv("UPBIT_API_KEY", "")
 UPBIT_API_SECRET = os.getenv("UPBIT_API_SECRET", "")
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "your_binance_api_key")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "your_binance_api_secret")
+
+# [New] 바이낸스 테스트넷 설정
+BINANCE_TESTNET = get_env_bool("BINANCE_TESTNET", False)
+
+if BINANCE_TESTNET:
+    BINANCE_API_KEY = os.getenv("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_API_KEY", ""))
+    BINANCE_API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
+else:
+    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "your_binance_api_key")
+    BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "your_binance_api_secret")
 
 BINANCE_SPOT_SYMBOLS_STR = os.getenv("BINANCE_SPOT_SYMBOLS", "BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT")
 BINANCE_SPOT_SYMBOLS = [s.strip() for s in BINANCE_SPOT_SYMBOLS_STR.split(",")]
@@ -299,6 +307,12 @@ MONITORING_CONFIG = {
     "log_level": "INFO",                # 로그 레벨: DEBUG, INFO, WARNING, ERROR
     "max_log_size": 100000000,          # 최대 로그 크기: 100MB 도달 시 새파일
 }
+
+# [New] 백테스트 결과 자동 반영 여부 (.env에서 AUTO_UPDATE_ENV=False로 설정 시 비활성화)
+AUTO_UPDATE_ENV = get_env_bool("AUTO_UPDATE_ENV", True)
+
+# [New] 백테스트 실행 여부 (봇 시작 시 및 정기 실행 포함)
+ENABLE_BACKTEST = get_env_bool("ENABLE_BACKTEST", True)
 
 """
 ================================================================================
